@@ -16,6 +16,7 @@ limitations under the License.
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
 """Inference-only DeepseekV2 model."""
+import logging
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -48,6 +49,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.model_runner import InputMetadata
+
+logger = logging.getLogger(__name__)
 
 
 class DeepseekV2MLP(nn.Module):
@@ -653,17 +656,18 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if q_lora_rank is not None:
-                if "self_attn.q_b_proj" in name:
-                    weights_fusion_dict[name] = loaded_weight
-            else:
-                if "self_attn.q_proj" in name:
-                    weights_fusion_dict[name] = loaded_weight
+            if global_server_args_dict["enable_mla"]:
+                if q_lora_rank is not None:
+                    if "self_attn.q_b_proj" in name:
+                        weights_fusion_dict[name] = loaded_weight
+                else:
+                    if "self_attn.q_proj" in name:
+                        weights_fusion_dict[name] = loaded_weight
 
-            if "self_attn.kv_b_proj" in name:
-                weights_fusion_dict[name] = loaded_weight
-            if "self_attn.o_proj" in name:
-                weights_fusion_dict[name] = loaded_weight
+                if "self_attn.kv_b_proj" in name:
+                    weights_fusion_dict[name] = loaded_weight
+                if "self_attn.o_proj" in name:
+                    weights_fusion_dict[name] = loaded_weight
 
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -714,8 +718,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                         )
                         weight_loader(param, loaded_weight)
 
-        print("weight fusion")
-        # weights fusion
+        if not global_server_args_dict["enable_mla"]:
+            return
+
+        logger.info("start weight fusion")
         for layer_id in tqdm(range(self.config.num_hidden_layers)):
             if q_lora_rank is not None:
                 q_proj_weight = weights_fusion_dict[
@@ -799,6 +805,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                 fused_vo_proj_param, "weight_loader", default_weight_loader
             )
             weight_loader(fused_vo_proj_param, fused_vo_proj_weight)
+
+        logger.info("weight fusion finished")
 
 
 EntryClass = DeepseekV2ForCausalLM
