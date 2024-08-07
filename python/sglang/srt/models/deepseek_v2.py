@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
+from tqdm import tqdm
 from transformers import PretrainedConfig
 from vllm.config import CacheConfig
 from vllm.distributed import (
@@ -349,27 +350,27 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
-        if self.q_lora_rank is not None:
-            self.q_a_proj = ReplicatedLinear(
-                self.hidden_size,
-                self.q_lora_rank,
-                bias=False,
-                quant_config=quant_config,
-            )
-            self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
-            self.q_b_proj = ColumnParallelLinear(
-                q_lora_rank,
-                self.num_heads * self.qk_head_dim,
-                bias=False,
-                quant_config=quant_config,
-            )
-        else:
-            self.q_proj = ColumnParallelLinear(
-                self.hidden_size,
-                self.num_heads * self.qk_head_dim,
-                bias=False,
-                quant_config=quant_config,
-            )
+        # if self.q_lora_rank is not None:
+        #     self.q_a_proj = ReplicatedLinear(
+        #         self.hidden_size,
+        #         self.q_lora_rank,
+        #         bias=False,
+        #         quant_config=quant_config,
+        #     )
+        #     self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+        #     self.q_b_proj = ColumnParallelLinear(
+        #         q_lora_rank,
+        #         self.num_heads * self.qk_head_dim,
+        #         bias=False,
+        #         quant_config=quant_config,
+        #     )
+        # else:
+        #     self.q_proj = ColumnParallelLinear(
+        #         self.hidden_size,
+        #         self.num_heads * self.qk_head_dim,
+        #         bias=False,
+        #         quant_config=quant_config,
+        #     )
 
         self.kv_a_proj_with_mqa = ReplicatedLinear(
             self.hidden_size,
@@ -378,19 +379,19 @@ class DeepseekV2AttentionMLA(nn.Module):
             quant_config=quant_config,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
-        self.kv_b_proj = ColumnParallelLinear(
-            self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False,
-            quant_config=quant_config,
-        )
-        # O projection.
-        self.o_proj = RowParallelLinear(
-            self.num_heads * self.v_head_dim,
-            self.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-        )
+        # self.kv_b_proj = ColumnParallelLinear(
+        #     self.kv_lora_rank,
+        #     self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+        #     bias=False,
+        #     quant_config=quant_config,
+        # )
+        # # O projection.
+        # self.o_proj = RowParallelLinear(
+        #     self.num_heads * self.v_head_dim,
+        #     self.hidden_size,
+        #     bias=False,
+        #     quant_config=quant_config,
+        # )
         rope_scaling["type"] = "deepseek_yarn"
         self.rotary_emb = get_rope(
             qk_rope_head_dim,
@@ -416,12 +417,33 @@ class DeepseekV2AttentionMLA(nn.Module):
             v_head_dim=self.kv_lora_rank,
         )
 
-        kv_b_proj = self.kv_b_proj
-        w_kc, w_vc = kv_b_proj.weight.unflatten(
-            0, (-1, qk_nope_head_dim + v_head_dim)
-        ).split([qk_nope_head_dim, v_head_dim], dim=1)
-        self.w_kc = w_kc
-        self.w_vc = w_vc
+        # kv_b_proj = self.kv_b_proj
+        # w_kc, w_vc = kv_b_proj.weight.unflatten(
+        #     0, (-1, qk_nope_head_dim + v_head_dim)
+        # ).split([qk_nope_head_dim, v_head_dim], dim=1)
+        # self.w_kc = w_kc
+        # self.w_vc = w_vc
+
+        self.fused_qk_proj = ColumnParallelLinear(
+            self.hidden_size,
+            self.num_heads * self.kv_lora_rank,
+            bias=False,
+            quant_config=quant_config,
+        )
+
+        self.q_rope_proj = ColumnParallelLinear(
+            self.hidden_size,
+            self.num_heads * self.qk_rope_head_dim,
+            bias=False,
+            quant_config=quant_config,
+        )
+
+        self.fused_vo_proj = RowParallelLinear(
+            self.num_heads * self.kv_lora_rank,
+            self.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+        )
 
     def forward(
         self,
@@ -433,17 +455,22 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_input = hidden_states.new_empty(
             q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim
         )
-        if self.q_lora_rank is not None:
-            q = self.q_a_proj(hidden_states)[0]
-            q = self.q_a_layernorm(q)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-        else:
-            q = self.q_proj(hidden_states)[0].view(
-                -1, self.num_local_heads, self.qk_head_dim
-            )
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_nope_out = q_input[..., : self.kv_lora_rank]
-        torch.bmm(q_nope.transpose(0, 1), self.w_kc, out=q_nope_out.transpose(0, 1))
+        # if self.q_lora_rank is not None:
+        #     q = self.q_a_proj(hidden_states)[0]
+        #     q = self.q_a_layernorm(q)
+        #     q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+        # else:
+        #     q = self.q_proj(hidden_states)[0].view(
+        #         -1, self.num_local_heads, self.qk_head_dim
+        #     )
+
+        q_nope = self.fused_qk_proj(hidden_states)[0].view(
+            -1, self.num_local_heads, self.kv_lora_rank
+        )
+        q_pe = self.q_rope_proj(hidden_states)[0].view(
+            -1, self.num_local_heads, self.qk_rope_head_dim
+        )
+        q_input[..., : self.kv_lora_rank] = q_nope
 
         k_input = self.kv_a_proj_with_mqa(hidden_states)[0].unsqueeze(1)
         k_pe = k_input[..., self.kv_lora_rank :]
@@ -456,18 +483,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         k_input[..., self.kv_lora_rank :] = k_pe
 
         attn_output = self.attn(q_input, k_input, v_input, input_metadata)
-        attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
-        attn_bmm_output = attn_output.new_empty(
-            q_len, self.num_local_heads, self.v_head_dim
-        )
-        torch.bmm(
-            attn_output.transpose(0, 1),
-            self.w_vc.transpose(1, 2).contiguous(),
-            out=attn_bmm_output.transpose(0, 1),
-        )
-
-        attn_output = attn_bmm_output.flatten(1, 2)
-        output, _ = self.o_proj(attn_output)
+        output = self.fused_vo_proj(attn_output)[0]
 
         return output
 
@@ -659,8 +675,26 @@ class DeepseekV2ForCausalLM(nn.Module):
             num_experts=self.config.n_routed_experts,
         )
 
+        q_lora_rank = (
+            self.config.q_lora_rank if hasattr(self.config, "q_lora_rank") else None
+        )
+
+        weights_fusion_dict = {}
+
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            if q_lora_rank is not None:
+                if "self_attn.q_b_proj" in name:
+                    weights_fusion_dict[name] = loaded_weight
+            else:
+                if "self_attn.q_proj" in name:
+                    weights_fusion_dict[name] = loaded_weight
+
+            if "self_attn.kv_b_proj" in name:
+                weights_fusion_dict[name] = loaded_weight
+            if "self_attn.o_proj" in name:
+                weights_fusion_dict[name] = loaded_weight
+
             if "rotary_emb.inv_freq" in name:
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -703,12 +737,95 @@ class DeepseekV2ForCausalLM(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+                    if name in params_dict.keys():
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
 
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
+        print("weight fusion")
+        # weights fusion
+        for layer_id in tqdm(range(self.config.num_hidden_layers)):
+            q_proj_weight = weights_fusion_dict[
+                f"model.layers.{layer_id}.self_attn.q_proj.weight"
+            ]
+            kv_b_proj_weight = weights_fusion_dict[
+                f"model.layers.{layer_id}.self_attn.kv_b_proj.weight"
+            ]
+            o_proj_weight = weights_fusion_dict[
+                f"model.layers.{layer_id}.self_attn.o_proj.weight"
+            ]
+
+            k_b_proj_weight = kv_b_proj_weight.view(
+                self.config.num_attention_heads,
+                self.config.qk_nope_head_dim * 2,
+                self.config.kv_lora_rank,
+            )[:, : self.config.qk_nope_head_dim, :]
+            v_b_proj_weight = kv_b_proj_weight.T.view(
+                self.config.kv_lora_rank,
+                self.config.num_attention_heads,
+                self.config.qk_nope_head_dim * 2,
+            )[:, :, self.config.qk_nope_head_dim :].transpose(0, 1)
+
+            q_proj_weight = q_proj_weight.transpose(0, 1)
+            q_nope_proj_weight, q_rope_proj_weight = torch.split(
+                q_proj_weight.view(
+                    self.config.hidden_size,
+                    -1,
+                    self.config.qk_nope_head_dim + self.config.qk_rope_head_dim,
+                ),
+                [self.config.qk_nope_head_dim, self.config.qk_rope_head_dim],
+                dim=-1,
+            )
+
+            q_rope_proj_param = params_dict[
+                f"model.layers.{layer_id}.self_attn.q_rope_proj.weight"
+            ]
+            weight_loader = getattr(
+                q_rope_proj_param, "weight_loader", default_weight_loader
+            )
+            weight_loader(q_rope_proj_param, q_rope_proj_weight.flatten(1, 2).T)
+
+            q_nope_proj_weight = q_nope_proj_weight.transpose(0, 1).to(torch.float64)
+            k_b_proj_weight = k_b_proj_weight.to(torch.float64)
+            fused_qk_proj_weight = (
+                torch.bmm(q_nope_proj_weight, k_b_proj_weight)
+                .transpose(0, 1)
+                .flatten(1, 2)
+                .T
+            )
+
+            fused_qk_proj_param = params_dict[
+                f"model.layers.{layer_id}.self_attn.fused_qk_proj.weight"
+            ]
+            weight_loader = getattr(
+                fused_qk_proj_param, "weight_loader", default_weight_loader
+            )
+            weight_loader(fused_qk_proj_param, fused_qk_proj_weight)
+
+            fused_qk_proj_weight = torch.cat(
+                (fused_qk_proj_weight, q_rope_proj_weight.flatten(1, 2).T), dim=0
+            )
+
+            o_proj_weight = o_proj_weight.T.view(
+                self.config.num_attention_heads, self.config.qk_nope_head_dim, -1
+            )
+            fused_vo_proj_weight = (
+                torch.bmm(
+                    v_b_proj_weight.to(torch.float64), o_proj_weight.to(torch.float64)
+                )
+                .flatten(0, 1)
+                .T
+            )
+
+            fused_vo_proj_param = params_dict[
+                f"model.layers.{layer_id}.self_attn.fused_vo_proj.weight"
+            ]
+            weight_loader = getattr(
+                fused_vo_proj_param, "weight_loader", default_weight_loader
+            )
+            weight_loader(fused_vo_proj_param, fused_vo_proj_weight)
 
 
 EntryClass = DeepseekV2ForCausalLM
