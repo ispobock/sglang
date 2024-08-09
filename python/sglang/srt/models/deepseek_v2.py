@@ -395,12 +395,20 @@ class DeepseekV2AttentionMLA(nn.Module):
             v_head_dim=self.kv_lora_rank,
         )
 
-        self.fused_qk_proj = ColumnParallelLinear(
-            self.hidden_size,
-            self.num_heads * (self.kv_lora_rank + self.qk_rope_head_dim),
-            bias=False,
-            quant_config=quant_config,
-        )
+        if self.q_lora_rank is not None:
+            self.fused_qk_proj = ColumnParallelLinear(
+                self.q_lora_rank,
+                self.num_heads * (self.kv_lora_rank + self.qk_rope_head_dim),
+                bias=False,
+                quant_config=quant_config,
+            )
+        else:
+            self.fused_qk_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.num_heads * (self.kv_lora_rank + self.qk_rope_head_dim),
+                bias=False,
+                quant_config=quant_config,
+            )
 
         self.fused_vo_proj = RowParallelLinear(
             self.num_heads * self.kv_lora_rank,
@@ -676,26 +684,28 @@ class DeepseekV2ForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
+                if name in params_dict.keys():
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                    break
             else:
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        weight_name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
-                    break
+                    if name in params_dict.keys():
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            weight_name,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
+                        break
                 else:
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
