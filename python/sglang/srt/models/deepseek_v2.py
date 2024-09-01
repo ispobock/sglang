@@ -419,6 +419,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         self.w_kc = None
         self.w_vc = None
+        self.w_scale = None
 
     def forward(
         self,
@@ -439,7 +440,12 @@ class DeepseekV2AttentionMLA(nn.Module):
                 -1, self.num_local_heads, self.qk_head_dim
             )
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
+        if self.w_scale is not None:
+            q_nope_out = torch.bmm(
+                q_nope.transpose(0, 1), self.w_kc.to(torch.bfloat16) * self.w_scale
+            )
+        else:
+            q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
         q_input[..., : self.kv_lora_rank] = q_nope_out.transpose(0, 1)
 
         latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
@@ -456,7 +462,12 @@ class DeepseekV2AttentionMLA(nn.Module):
         attn_output = self.attn(q_input, k_input, v_input, input_metadata)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
-        attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
+        if self.w_scale is not None:
+            attn_bmm_output = torch.bmm(
+                attn_output.transpose(0, 1), self.w_vc.to(torch.bfloat16) * self.w_scale
+            )
+        else:
+            attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         output, _ = self.o_proj(attn_output)
 
@@ -712,6 +723,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                 ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
                 self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
                 self_attn.w_vc = w_vc.transpose(1, 2)
+                if hasattr(self_attn.kv_b_proj, "weight_scale"):
+                    self_attn.w_scale = self_attn.kv_b_proj.weight_scale.to(
+                        torch.bfloat16
+                    )
                 del self_attn.kv_b_proj
 
 
