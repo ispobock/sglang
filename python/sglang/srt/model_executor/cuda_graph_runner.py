@@ -105,7 +105,7 @@ class CudaGraphRunner:
             self.capture_bs = list(range(1, 32)) + [64, 128]
         else:
             self.capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
-        self.compile_bs = [1, 2, 4, 8, 16, 24, 32] if self.use_torch_compile else []
+        self.compile_bs = [1] if self.use_torch_compile else []
 
         # Common inputs
         self.max_bs = max(self.capture_bs)
