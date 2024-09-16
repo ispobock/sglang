@@ -5,6 +5,7 @@ from abc import abstractmethod
 from typing import List, Optional, Tuple
 
 import torch
+from torch.nn import functional as F
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -19,6 +20,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from sglang.srt.layers.fused_moe.fused_moe import (
     fused_experts,
     fused_topk,
+    fused_topk_native,
     grouped_topk,
 )
 from sglang.srt.utils import set_weight_attrs
@@ -139,6 +141,37 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             topk_ids=topk_ids,
             inplace=True,
         )
+
+    def forward_native(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        use_grouped_topk: bool,
+        top_k: int,
+        router_logits: torch.Tensor,
+        renormalize: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+    ) -> torch.Tensor:
+
+        topk_weights, topk_ids = FusedMoE.select_experts_native(
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+        )
+
+        w13_weights = layer.w13_weight[topk_ids]
+        w1_weights, w3_weights = torch.chunk(w13_weights, 2, dim=2)
+        w2_weights = layer.w2_weight[topk_ids]
+
+        x1 = F.silu(torch.einsum("ti,taoi -> tao", x, w1_weights))
+        x3 = torch.einsum("ti, taoi -> tao", x, w3_weights)
+        expert_outs = torch.einsum("tao, taio -> tai", (x1 * x3), w2_weights)
+        return torch.einsum("tai,ta -> ti", expert_outs, topk_weights)
 
     def forward_cpu(self, *args, **kwargs):
         raise NotImplementedError("The CPU backend currently does not support MoE.")
@@ -298,6 +331,39 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             topk_weights, topk_ids = fused_topk(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=top_k,
+                renormalize=renormalize,
+            )
+
+        return topk_weights, topk_ids
+
+    @staticmethod
+    def select_experts_native(
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        use_grouped_topk: bool,
+        renormalize: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+    ):
+
+        # DeekSeekv2 uses grouped_top_k
+        if use_grouped_topk:
+            assert topk_group is not None
+            assert num_expert_group is not None
+            topk_weights, topk_ids = grouped_topk(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=top_k,
+                renormalize=renormalize,
+                num_expert_group=num_expert_group,
+                topk_group=topk_group,
+            )
+        else:
+            topk_weights, topk_ids = fused_topk_native(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
                 topk=top_k,

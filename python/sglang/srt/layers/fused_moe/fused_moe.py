@@ -11,6 +11,7 @@ import torch
 import triton
 import triton.language as tl
 from flashinfer.activation import silu_and_mul
+from torch.nn import functional as F
 from vllm import _custom_ops as ops
 
 logger = logging.getLogger(__name__)
@@ -406,6 +407,29 @@ def fused_topk(
         gating_output.float(),  # TODO(woosuk): Optimize this.
     )
     del token_expert_indicies  # Not used. Will be used in the future.
+
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    return topk_weights, topk_ids
+
+
+def fused_topk_native(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+):
+    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+
+    M, _ = hidden_states.shape
+
+    topk_weights = torch.empty(
+        M, topk, dtype=torch.float32, device=hidden_states.device
+    )
+    topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
+
+    topk_weights = F.softmax(gating_output.float(), dim=-1)
+    topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
 
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
