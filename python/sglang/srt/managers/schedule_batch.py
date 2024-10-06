@@ -52,6 +52,7 @@ global_server_args_dict = {
     "sampling_backend": ServerArgs.sampling_backend,
     "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
     "disable_mla": ServerArgs.disable_mla,
+    "enable_mla_dp": ServerArgs.enable_mla_dp,
     "torchao_config": ServerArgs.torchao_config,
 }
 
@@ -230,6 +231,10 @@ class Req:
         self.regex_fsm: RegexGuide = None
         self.regex_fsm_state: int = 0
         self.jump_forward_map: JumpForwardMap = None
+
+        # Data parallel attention
+        self.dp_rank: int = None
+        self.is_local: bool = False
 
     # whether request reached finished condition
     def finished(self) -> bool:
@@ -410,6 +415,10 @@ class ScheduleBatch:
     seq_lens: List[int] = None
     out_cache_loc: torch.Tensor = None
 
+    # For data parallel attention
+    dp_input_indices: List[List[int]] = None
+    local_seq_indices: List[int] = None
+
     # For processing logprobs
     return_logprob: bool = False
     top_logprobs_nums: Optional[List[int]] = None
@@ -473,26 +482,61 @@ class ScheduleBatch:
 
         return out_cache_loc
 
+    def prepare_for_dp_forward(self, cur_rank: int, world_size: int):
+        # Allocate dp rank with greedy strategy
+        rank_loads = [0] * world_size
+        reqs = sorted(self.reqs, key=lambda r: len(r.fill_ids), reverse=True)
+
+        for req in reqs:
+            if req.dp_rank is None:
+                rank = rank_loads.index(min(rank_loads))
+                req.dp_rank = rank
+                req.is_local = req.dp_rank == cur_rank
+            rank_loads[req.dp_rank] += len(req.fill_ids)
+
+        # Prepare meta data for dp forward
+        dp_input_indices = [[] for _ in range(world_size)]
+        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in self.reqs]
+        offset = 0
+        for i, req_input_ids in enumerate(input_ids):
+            dp_input_indices[self.reqs[i].dp_rank].extend(
+                list(range(offset, offset + len(req_input_ids)))
+            )
+            offset += len(req_input_ids)
+        self.dp_input_indices = dp_input_indices
+        self.local_seq_indices = [
+            idx for idx, req in enumerate(self.reqs) if req.is_local
+        ]
+
     def prepare_for_extend(self, vocab_size: int):
         self.forward_mode = ForwardMode.EXTEND
 
-        bs = len(self.reqs)
         reqs = self.reqs
+        bs = len(reqs)
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
-        seq_lens = []
+        seq_lens = [len(r.fill_ids) for r in reqs]
 
-        # Allocate memory
-        req_pool_indices = self.alloc_req_slots(bs)
-        out_cache_loc = self.alloc_token_slots(extend_num_tokens)
+        if self.dp_input_indices is not None:
+            local_reqs = [req for req in reqs if req.is_local]
+            local_bs = len(local_reqs)
+            local_input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in local_reqs]
+            local_extend_num_tokens = sum(len(ids) for ids in local_input_ids)
+            # Allocate memory for dp local requests
+            req_pool_indices = self.alloc_req_slots(local_bs)
+            out_cache_loc = self.alloc_token_slots(local_extend_num_tokens)
+            upd_reqs = local_reqs
+        else:
+            # Allocate memory
+            req_pool_indices = self.alloc_req_slots(bs)
+            out_cache_loc = self.alloc_token_slots(extend_num_tokens)
+            upd_reqs = reqs
 
         pt = 0
-        for i, req in enumerate(reqs):
-            req.req_pool_idx = req_pool_indices[i]
+        for i, req in enumerate(upd_reqs):
             pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
-            seq_lens.append(seq_len)
             assert seq_len - pre_len == req.extend_input_len
-
+            req.req_pool_idx = req_pool_indices[i]
             if pre_len > 0:
                 self.req_to_token_pool.req_to_token[req.req_pool_idx][
                     :pre_len
@@ -501,6 +545,11 @@ class ScheduleBatch:
             self.req_to_token_pool.req_to_token[req.req_pool_idx][pre_len:seq_len] = (
                 out_cache_loc[pt : pt + req.extend_input_len]
             )
+            pt += req.extend_input_len
+
+        for i, req in enumerate(reqs):
+            pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
+            assert seq_len - pre_len == req.extend_input_len
 
             # Compute the relative logprob_start_len in an extend batch
             if req.logprob_start_len >= pre_len:
@@ -509,15 +558,13 @@ class ScheduleBatch:
                 )
             else:
                 extend_logprob_start_len = req.extend_input_len - 1
-
             req.extend_logprob_start_len = extend_logprob_start_len
-            pt += req.extend_input_len
 
         # Set fields
         with out_cache_loc.device:
             self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32)
-            self.req_pool_indices = torch.tensor(req_pool_indices)
-            self.seq_lens = torch.tensor(seq_lens)
+            self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int32)
+            self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
 
         self.extend_num_tokens = extend_num_tokens
         self.out_cache_loc = out_cache_loc
@@ -728,13 +775,28 @@ class ScheduleBatch:
         )
         self.seq_lens.add_(1)
 
-        # Alloc mem
-        bs = len(self.reqs)
-        self.out_cache_loc = self.alloc_token_slots(bs)
-
-        self.req_to_token_pool.req_to_token[
-            self.req_pool_indices, self.seq_lens - 1
-        ] = self.out_cache_loc
+        if self.dp_input_indices is not None:
+            dp_input_indices = [[] for _ in range(len(self.dp_input_indices))]
+            for i in range(len(input_ids)):
+                dp_input_indices[self.reqs[i].dp_rank].append(i)
+            self.dp_input_indices = dp_input_indices
+            self.local_seq_indices = [
+                idx for idx, req in enumerate(self.reqs) if req.is_local
+            ]
+            local_reqs = [req for req in self.reqs if req.is_local]
+            bs = len(local_reqs)
+            # Alloc mem for dp local requests
+            self.out_cache_loc = self.alloc_token_slots(bs)
+            self.req_to_token_pool.req_to_token[
+                self.req_pool_indices, self.seq_lens[self.local_seq_indices] - 1
+            ] = self.out_cache_loc
+        else:
+            # Alloc mem
+            bs = len(self.reqs)
+            self.out_cache_loc = self.alloc_token_slots(bs)
+            self.req_to_token_pool.req_to_token[
+                self.req_pool_indices, self.seq_lens - 1
+            ] = self.out_cache_loc
 
     def filter_batch(self, unfinished_indices: List[int]):
         if unfinished_indices is None or len(unfinished_indices) == 0:
@@ -746,11 +808,21 @@ class ScheduleBatch:
             # No need to filter
             return
 
-        self.reqs = [self.reqs[i] for i in unfinished_indices]
         new_indices = torch.tensor(
             unfinished_indices, dtype=torch.int32, device=self.seq_lens.device
         )
-        self.req_pool_indices = self.req_pool_indices[new_indices]
+        if self.dp_input_indices is None:
+            self.req_pool_indices = self.req_pool_indices[new_indices]
+        else:
+            indices_local = [i for i in range(len(self.reqs)) if self.reqs[i].is_local]
+            unfinished_indices_local = [
+                i for i, idx in enumerate(indices_local) if idx in unfinished_indices
+            ]
+            new_indices_local = torch.tensor(
+                unfinished_indices_local, dtype=torch.int32, device=self.seq_lens.device
+            )
+            self.req_pool_indices = self.req_pool_indices[new_indices_local]
+        self.reqs = [self.reqs[i] for i in unfinished_indices]
         self.seq_lens = self.seq_lens[new_indices]
         self.out_cache_loc = None
         self.return_logprob = any(req.return_logprob for req in self.reqs)
@@ -813,6 +885,8 @@ class ScheduleBatch:
             req_pool_indices=self.req_pool_indices,
             seq_lens=self.seq_lens,
             out_cache_loc=self.out_cache_loc,
+            dp_input_indices=self.dp_input_indices,
+            local_seq_indices=self.local_seq_indices,
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
             extend_seq_lens=extend_seq_lens,
@@ -836,6 +910,10 @@ class ModelWorkerBatch:
     seq_lens: torch.Tensor
     # The indices of output tokens in the token_to_kv_pool
     out_cache_loc: torch.Tensor
+
+    # For data parallel attention
+    dp_input_indices: List[List[int]]
+    local_seq_indices: List[int]
 
     # For logprob
     return_logprob: bool

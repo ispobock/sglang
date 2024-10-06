@@ -27,9 +27,13 @@ class TritonAttnBackend(AttentionBackend):
 
         self.decode_attention_fwd = decode_attention_fwd
         self.extend_attention_fwd = extend_attention_fwd
-        self.num_head = (
-            model_runner.model_config.num_attention_heads // model_runner.tp_size
-        )
+
+        if global_server_args_dict.get("enable_mla_dp", False):
+            self.num_head = model_runner.model_config.num_attention_heads
+        else:
+            self.num_head = (
+                model_runner.model_config.num_attention_heads // model_runner.tp_size
+            )
 
         if global_server_args_dict.get("triton_attention_reduce_in_fp32", False):
             self.reduce_dtype = torch.float32
@@ -43,23 +47,35 @@ class TritonAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
 
-        if forward_batch.forward_mode.is_decode():
-            start_loc = torch.zeros_like(forward_batch.seq_lens, dtype=torch.int32)
-            start_loc[1:] = torch.cumsum(forward_batch.seq_lens[:-1], dim=0)
+        if forward_batch.local_seq_indices is not None:
+            seq_lens = forward_batch.seq_lens[forward_batch.local_seq_indices]
+        else:
+            seq_lens = forward_batch.seq_lens
 
-            total_num_tokens = torch.sum(forward_batch.seq_lens).item()
+        if forward_batch.forward_mode.is_decode():
+            start_loc = torch.zeros_like(seq_lens, dtype=torch.int32)
+            start_loc[1:] = torch.cumsum(seq_lens[:-1], dim=0)
+
+            total_num_tokens = torch.sum(seq_lens).item()
             attn_logits = torch.empty(
                 (self.num_head, total_num_tokens),
                 dtype=self.reduce_dtype,
                 device="cuda",
             )
 
-            max_seq_len = torch.max(forward_batch.seq_lens).item()
+            max_seq_len = torch.max(seq_lens).item() if seq_lens.shape[0] > 0 else 0
             max_extend_len = None
         else:
             start_loc = attn_logits = max_seq_len = None
-            prefix_lens = forward_batch.extend_prefix_lens
-            max_extend_len = torch.max(forward_batch.seq_lens - prefix_lens).item()
+            if forward_batch.local_seq_indices is not None:
+                prefix_lens = forward_batch.extend_prefix_lens[
+                    forward_batch.local_seq_indices
+                ]
+            else:
+                prefix_lens = forward_batch.extend_prefix_lens
+            max_extend_len = (
+                torch.max(seq_lens - prefix_lens).item() if seq_lens.shape[0] > 0 else 0
+            )
 
         self.forward_metadata = start_loc, attn_logits, max_seq_len, max_extend_len
 
@@ -108,6 +124,20 @@ class TritonAttnBackend(AttentionBackend):
             layer.layer_id, forward_batch.out_cache_loc, k, v
         )
 
+        if forward_batch.local_seq_indices is not None:
+            seq_lens = forward_batch.seq_lens[
+                forward_batch.local_seq_indices
+            ].contiguous()
+            extend_seq_lens = forward_batch.extend_seq_lens[
+                forward_batch.local_seq_indices
+            ].contiguous()
+            extend_start_loc = torch.zeros_like(extend_seq_lens)
+            extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+        else:
+            seq_lens = forward_batch.seq_lens
+            extend_seq_lens = forward_batch.extend_seq_lens
+            extend_start_loc = forward_batch.extend_start_loc
+
         start_loc, attn_logits, max_seq_len, max_extend_len = self.forward_metadata
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -118,9 +148,9 @@ class TritonAttnBackend(AttentionBackend):
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            forward_batch.extend_seq_lens,
-            forward_batch.extend_start_loc,
+            seq_lens,
+            extend_seq_lens,
+            extend_start_loc,
             max_extend_len,
             layer.scaling,
             layer.logit_cap,
@@ -144,6 +174,13 @@ class TritonAttnBackend(AttentionBackend):
             layer.layer_id, forward_batch.out_cache_loc, k, v
         )
 
+        if forward_batch.local_seq_indices is not None:
+            seq_lens = forward_batch.seq_lens[
+                forward_batch.local_seq_indices
+            ].contiguous()
+        else:
+            seq_lens = forward_batch.seq_lens
+
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
@@ -152,7 +189,7 @@ class TritonAttnBackend(AttentionBackend):
             forward_batch.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             start_loc,
-            forward_batch.seq_lens,
+            seq_lens,
             attn_logits,
             max_seq_len,
             layer.scaling,

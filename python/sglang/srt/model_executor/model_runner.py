@@ -95,7 +95,7 @@ class ModelRunner:
             self.model_config.attention_arch == AttentionArch.MLA
             and not self.server_args.disable_mla
         ):
-            logger.info("MLA optimization is tunred on. Use triton backend.")
+            logger.info("MLA optimization is turned on. Use triton backend.")
             self.server_args.attention_backend = "triton"
 
         if self.is_multimodal_model:
@@ -117,6 +117,7 @@ class ModelRunner:
                 "sampling_backend": server_args.sampling_backend,
                 "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
                 "disable_mla": server_args.disable_mla,
+                "enable_mla_dp": server_args.enable_mla_dp,
                 "torchao_config": server_args.torchao_config,
             }
         )

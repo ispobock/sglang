@@ -16,14 +16,17 @@ limitations under the License.
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
 """Inference-only DeepseekV2 model."""
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
+import torch.distributed
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.config import CacheConfig
 from vllm.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.fused_moe import FusedMoE
@@ -321,6 +324,33 @@ class DeepseekV2Attention(nn.Module):
         return output
 
 
+def all_gather_and_permute(
+    input_tensor: torch.Tensor, dp_input_indices: List[List[int]]
+):
+    world_size = len(dp_input_indices)
+    if world_size == 1:
+        return input_tensor
+
+    local_lens = [len(indices) for indices in dp_input_indices]
+    max_len = max(local_lens)
+
+    padded_tensor = torch.nn.functional.pad(
+        input_tensor, (0, 0, 0, max_len - input_tensor.shape[0])
+    )
+
+    output_tensors = [torch.empty_like(padded_tensor) for _ in range(world_size)]
+    torch.distributed.all_gather(
+        output_tensors, padded_tensor, group=get_tp_group().device_group
+    )
+
+    gathered_tensors = input_tensor.new_empty(sum(local_lens), input_tensor.shape[-1])
+
+    for rank, input_indices in enumerate(dp_input_indices):
+        gathered_tensors[input_indices] = output_tensors[rank][: len(input_indices)]
+
+    return gathered_tensors
+
+
 class DeepseekV2AttentionMLA(nn.Module):
 
     def __init__(
@@ -339,6 +369,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         layer_id=None,
+        use_dp=False,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -350,31 +381,84 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.num_heads = num_heads
-        tp_size = get_tensor_model_parallel_world_size()
-        assert num_heads % tp_size == 0
-        self.num_local_heads = num_heads // tp_size
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
+        self.use_dp = use_dp
 
-        if self.q_lora_rank is not None:
-            self.q_a_proj = ReplicatedLinear(
-                self.hidden_size,
-                self.q_lora_rank,
+        if use_dp:
+            # For data parallel attention
+            self.tp_rank = get_tensor_model_parallel_rank()
+            if self.q_lora_rank is not None:
+                self.q_a_proj = ReplicatedLinear(
+                    self.hidden_size,
+                    self.q_lora_rank,
+                    bias=False,
+                    quant_config=quant_config,
+                )
+                self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+                self.q_b_proj = ReplicatedLinear(
+                    q_lora_rank,
+                    self.num_heads * self.qk_head_dim,
+                    bias=False,
+                    quant_config=quant_config,
+                )
+            else:
+                self.q_proj = ReplicatedLinear(
+                    self.hidden_size,
+                    self.num_heads * self.qk_head_dim,
+                    bias=False,
+                    quant_config=quant_config,
+                )
+            self.kv_b_proj = ReplicatedLinear(
+                self.kv_lora_rank,
+                self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
                 bias=False,
                 quant_config=quant_config,
             )
-            self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
-            self.q_b_proj = ColumnParallelLinear(
-                q_lora_rank,
-                self.num_heads * self.qk_head_dim,
+            # O projection.
+            self.o_proj = ReplicatedLinear(
+                self.num_heads * self.v_head_dim,
+                self.hidden_size,
                 bias=False,
                 quant_config=quant_config,
             )
         else:
-            self.q_proj = ColumnParallelLinear(
+            # For tensor parallel attention
+            tp_size = get_tensor_model_parallel_world_size()
+            assert num_heads % tp_size == 0
+            self.num_local_heads = num_heads // tp_size
+            if self.q_lora_rank is not None:
+                self.q_a_proj = ReplicatedLinear(
+                    self.hidden_size,
+                    self.q_lora_rank,
+                    bias=False,
+                    quant_config=quant_config,
+                )
+                self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+                self.q_b_proj = ColumnParallelLinear(
+                    q_lora_rank,
+                    self.num_heads * self.qk_head_dim,
+                    bias=False,
+                    quant_config=quant_config,
+                )
+            else:
+                self.q_proj = ColumnParallelLinear(
+                    self.hidden_size,
+                    self.num_heads * self.qk_head_dim,
+                    bias=False,
+                    quant_config=quant_config,
+                )
+            self.kv_b_proj = ColumnParallelLinear(
+                self.kv_lora_rank,
+                self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+                bias=False,
+                quant_config=quant_config,
+            )
+            # O projection.
+            self.o_proj = RowParallelLinear(
+                self.num_heads * self.v_head_dim,
                 self.hidden_size,
-                self.num_heads * self.qk_head_dim,
                 bias=False,
                 quant_config=quant_config,
             )
@@ -386,19 +470,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             quant_config=quant_config,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
-        self.kv_b_proj = ColumnParallelLinear(
-            self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False,
-            quant_config=quant_config,
-        )
-        # O projection.
-        self.o_proj = RowParallelLinear(
-            self.num_heads * self.v_head_dim,
-            self.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-        )
+
         rope_scaling["type"] = "deepseek_yarn"
         self.rotary_emb = get_rope(
             qk_rope_head_dim,
@@ -416,7 +488,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.scaling = self.scaling * mscale * mscale
 
         self.attn = RadixAttention(
-            self.num_local_heads,
+            self.num_heads if use_dp else self.num_local_heads,
             self.kv_lora_rank + self.qk_rope_head_dim,
             self.scaling,
             num_kv_heads=1,
@@ -429,6 +501,16 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.w_scale = None
 
     def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        if self.use_dp:
+            return self.forward_dp(positions, hidden_states, forward_batch)
+        return self.forward_tp(positions, hidden_states, forward_batch)
+
+    def forward_tp(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -491,6 +573,76 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         return output
 
+    def forward_dp(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        local_indices = forward_batch.dp_input_indices[self.tp_rank]
+        local_hidden_states = hidden_states[local_indices]
+        local_positions = positions[local_indices]
+        q_len = local_hidden_states.shape[0]
+        if q_len == 0:
+            return all_gather_and_permute(
+                local_hidden_states, forward_batch.dp_input_indices
+            )
+        q_input = local_hidden_states.new_empty(
+            q_len, self.num_heads, self.kv_lora_rank + self.qk_rope_head_dim
+        )
+        if self.q_lora_rank is not None:
+            q = self.q_a_proj(local_hidden_states)[0]
+            q = self.q_a_layernorm(q)
+            q = self.q_b_proj(q)[0].view(-1, self.num_heads, self.qk_head_dim)
+        else:
+            q = self.q_proj(local_hidden_states)[0].view(
+                -1, self.num_heads, self.qk_head_dim
+            )
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+        if self.w_kc.dtype == torch.float8_e4m3fn:
+            q_nope_val, q_nope_scale = input_to_float8(
+                q_nope.transpose(0, 1), torch.float8_e4m3fn
+            )
+            q_nope_out = bmm_fp8(
+                q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
+            )
+        else:
+            q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
+        q_input[..., : self.kv_lora_rank] = q_nope_out.transpose(0, 1)
+
+        latent_cache = self.kv_a_proj_with_mqa(local_hidden_states)[0]
+        v_input = latent_cache[..., : self.kv_lora_rank]
+        v_input = self.kv_a_layernorm(v_input.contiguous()).unsqueeze(1)
+        k_input = latent_cache.unsqueeze(1)
+        k_input[..., : self.kv_lora_rank] = v_input
+        k_pe = k_input[..., self.kv_lora_rank :]
+
+        q_pe, k_pe = self.rotary_emb(local_positions, q_pe, k_pe)
+        q_input[..., self.kv_lora_rank :] = q_pe
+        k_input[..., self.kv_lora_rank :] = k_pe
+
+        attn_output = self.attn(q_input, k_input, v_input, forward_batch)
+        attn_output = attn_output.view(-1, self.num_heads, self.kv_lora_rank)
+
+        if self.w_vc.dtype == torch.float8_e4m3fn:
+            attn_output_val, attn_output_scale = input_to_float8(
+                attn_output.transpose(0, 1), torch.float8_e4m3fn
+            )
+            attn_bmm_output = bmm_fp8(
+                attn_output_val,
+                self.w_vc,
+                attn_output_scale,
+                self.w_scale,
+                torch.bfloat16,
+            )
+        else:
+            attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
+        attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        output, _ = self.o_proj(attn_output)
+
+        return all_gather_and_permute(output, forward_batch.dp_input_indices)
+
 
 class DeepseekV2DecoderLayer(nn.Module):
 
@@ -524,6 +676,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 layer_id=layer_id,
+                use_dp=global_server_args_dict["enable_mla_dp"],
             )
         else:
             self.self_attn = DeepseekV2Attention(

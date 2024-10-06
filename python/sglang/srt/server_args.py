@@ -98,6 +98,7 @@ class ServerArgs:
     disable_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
+    enable_mla_dp: bool = False
     enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
     max_torch_compile_bs: int = 32
@@ -493,6 +494,11 @@ class ServerArgs:
             "--disable-mla",
             action="store_true",
             help="Disable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
+        )
+        parser.add_argument(
+            "--enable-mla-dp",
+            action="store_true",
+            help="Enable data parallelism for Multi-head Latent Attention (MLA).",
         )
         parser.add_argument(
             "--enable-mixed-chunk",

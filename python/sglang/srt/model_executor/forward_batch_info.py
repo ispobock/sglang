@@ -84,6 +84,10 @@ class ForwardBatch:
     # The indices of output tokens in the token_to_kv_pool
     out_cache_loc: torch.Tensor
 
+    # For data parallel attention
+    dp_input_indices: List[List[int]] = None
+    local_seq_indices: List[int] = None
+
     # For logprob
     return_logprob: bool = False
     top_logprobs_nums: Optional[List[int]] = None
@@ -127,6 +131,8 @@ class ForwardBatch:
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            dp_input_indices=batch.dp_input_indices,
+            local_seq_indices=batch.local_seq_indices,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             lora_paths=batch.lora_paths,

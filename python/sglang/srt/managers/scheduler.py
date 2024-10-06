@@ -94,6 +94,7 @@ class Scheduler:
         self.disable_regex_jump_forward = server_args.disable_regex_jump_forward
         self.lora_paths = server_args.lora_paths
         self.max_loras_per_batch = server_args.max_loras_per_batch
+        self.enable_mla_dp = server_args.enable_mla_dp
 
         # Init inter-process communication
         context = zmq.Context(2)
@@ -569,6 +570,9 @@ class Scheduler:
             self.token_to_kv_pool,
             self.tree_cache,
         )
+
+        if self.enable_mla_dp:
+            new_batch.prepare_for_dp_forward(self.tp_rank, self.tp_size)
         new_batch.prepare_for_extend(self.model_config.vocab_size)
 
         # Mixed-style chunked prefill
@@ -685,15 +689,16 @@ class Scheduler:
                         req.regex_fsm_state, next_token_ids[i]
                     )
 
-                if req.finished():
-                    self.tree_cache.cache_finished_req(req)
-                elif req not in batch.decoding_reqs:
-                    # To reduce overhead, only cache prefill reqs
-                    self.tree_cache.cache_unfinished_req(req)
+                if not self.enable_mla_dp or req.dp_rank == self.tp_rank:
+                    if req.finished():
+                        self.tree_cache.cache_finished_req(req)
+                    elif req not in batch.decoding_reqs:
+                        # To reduce overhead, only cache prefill reqs
+                        self.tree_cache.cache_unfinished_req(req)
 
-                if req is self.current_inflight_req:
-                    # Inflight request would get a new req idx
-                    self.req_to_token_pool.free(req.req_pool_idx)
+                    if req is self.current_inflight_req:
+                        # Inflight request would get a new req idx
+                        self.req_to_token_pool.free(req.req_pool_idx)
 
                 if req.return_logprob:
                     logprob_pt += self.add_logprob_return_values(
@@ -749,8 +754,8 @@ class Scheduler:
                 req.regex_fsm_state = req.regex_fsm.get_next_state(
                     req.regex_fsm_state, next_token_id
                 )
-
-            if req.finished():
+            
+            if req.finished() and (not self.enable_mla_dp or req.dp_rank == self.tp_rank):
                 self.tree_cache.cache_finished_req(req)
 
             if req.return_logprob:
