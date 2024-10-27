@@ -22,7 +22,9 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.fused_moe import FusedMoE
@@ -45,7 +47,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 
 if is_flashinfer_available():
@@ -351,7 +353,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.num_heads = num_heads
         tp_size = get_tensor_model_parallel_world_size()
         assert num_heads % tp_size == 0
-        self.num_local_heads = num_heads // tp_size
+        self.num_local_heads = num_heads
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -364,14 +366,14 @@ class DeepseekV2AttentionMLA(nn.Module):
                 quant_config=quant_config,
             )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
-            self.q_b_proj = ColumnParallelLinear(
+            self.q_b_proj = ReplicatedLinear(
                 q_lora_rank,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
                 quant_config=quant_config,
             )
         else:
-            self.q_proj = ColumnParallelLinear(
+            self.q_proj = ReplicatedLinear(
                 self.hidden_size,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
@@ -385,20 +387,20 @@ class DeepseekV2AttentionMLA(nn.Module):
             quant_config=quant_config,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
-        self.kv_b_proj = ColumnParallelLinear(
+        self.kv_b_proj = ReplicatedLinear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
             quant_config=quant_config,
         )
         # O projection.
-        self.o_proj = RowParallelLinear(
+        self.o_proj = ReplicatedLinear(
             self.num_heads * self.v_head_dim,
             self.hidden_size,
             bias=False,
             quant_config=quant_config,
         )
-        rope_scaling["rope_type"] = "deepseek_yarn"
+        rope_scaling["type"] = "deepseek_yarn"
         self.rotary_emb = get_rope(
             qk_rope_head_dim,
             rotary_dim=qk_rope_head_dim,
@@ -491,6 +493,59 @@ class DeepseekV2AttentionMLA(nn.Module):
         return output
 
 
+def all_gather(input_tensor: torch.Tensor, rank, world_size):
+    if world_size == 1:
+        return input_tensor
+
+    # print(f"[kebao] rank: {get_tensor_model_parallel_rank()} start all gather input:{input_tensor.size(0)} {input_tensor.device}")
+
+    local_len = torch.tensor(
+        [input_tensor.size(0)], dtype=torch.int64, device=input_tensor.device
+    )
+    all_lens = [torch.zeros_like(local_len) for _ in range(world_size)]
+
+    # print(f"[kebao] rank: {get_tensor_model_parallel_rank()} local_len: {local_len}")
+
+    torch.distributed.all_gather(all_lens, local_len, group=get_tp_group().device_group)
+
+    # print(f"[kebao] rank: {get_tensor_model_parallel_rank()} all_lens: {all_lens}")
+
+    max_len = max(l.item() for l in all_lens)
+    all_lens = [l.item() for l in all_lens]
+
+    if len(input_tensor.size()) == 1:
+        padded_tensor = torch.nn.functional.pad(
+            input_tensor, (0, max_len - input_tensor.shape[0])
+        )
+    else:
+        padded_tensor = torch.nn.functional.pad(
+            input_tensor, (0, 0, 0, max_len - input_tensor.shape[0])
+        )
+
+    # print(f"[kebao] rank: {get_tensor_model_parallel_rank()} padded_tensor: {padded_tensor.shape}")
+
+    output_tensors = [torch.zeros_like(padded_tensor) for _ in range(world_size)]
+    torch.distributed.all_gather(
+        output_tensors, padded_tensor, group=get_tp_group().device_group
+    )
+
+    # print(f"[kebao] rank: {get_tensor_model_parallel_rank()} output_tensors: {output_tensors[0].shape} {output_tensors[1].shape}")
+    # print(f"[kebao] rank: {get_tensor_model_parallel_rank()} all_lens: {all_lens[0]} {all_lens[1]}")
+
+    gathered_tensors = torch.concat(
+        [output_tensors[i][: all_lens[i]] for i in range(world_size)]
+    )
+
+    # print(f"[kebao] rank: {get_tensor_model_parallel_rank()} gathered_tensors: {gathered_tensors.shape}")
+
+    start_index = 0 if rank == 0 else sum(all_lens[:rank])
+    end_index = start_index + all_lens[rank]
+
+    # print(f"[kebao] rank: {get_tensor_model_parallel_rank()} start_index: {start_index}, end_index: {end_index}")
+
+    return gathered_tensors, start_index, end_index
+
+
 class DeepseekV2DecoderLayer(nn.Module):
 
     def __init__(
@@ -568,22 +623,54 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
+        # print(f"[kebao] dp={get_tensor_model_parallel_rank()} forward model 2")
+        if forward_batch.forward_mode != ForwardMode.DUMMY:
+            # Self Attention
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+            # print(f"[kebao] dp={get_tensor_model_parallel_rank()} forward model 3 {hidden_states.shape}")
+
+            # DP
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+
+            # print(f"[kebao] dp={get_tensor_model_parallel_rank()} forward model 4")
+
+            # Fully Connected
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+
+            # print(f"[kebao] dp={get_tensor_model_parallel_rank()} forward model 5")
+
+        # print(f"[kebao] rank={get_tensor_model_parallel_rank()} hidden_states shape1: {hidden_states.shape}")
+
+        # all gather
+        gathered_hidden_states, start_idx, end_idx = all_gather(
+            hidden_states,
+            get_tensor_model_parallel_rank(),
+            get_tensor_model_parallel_world_size(),
         )
 
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        # print(f"[kebao] rank={get_tensor_model_parallel_rank()} hidden_states shape2: {gathered_hidden_states.shape}")
+
+        hidden_states = self.mlp(gathered_hidden_states)
+
+        # print(f"[kebao] rank={get_tensor_model_parallel_rank()} hidden_states shape3: {hidden_states.shape}")
+
+        output = hidden_states[start_idx:end_idx]
+
+        # print(f"[kebao] rank={get_tensor_model_parallel_rank()} hidden_states shape4: {output.shape}")
+
+        # slice
+        return output, residual
 
 
 class DeepseekV2Model(nn.Module):
@@ -599,6 +686,7 @@ class DeepseekV2Model(nn.Module):
         super().__init__()
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.hidden_size = config.hidden_size
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -623,14 +711,24 @@ class DeepseekV2Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        input_ids, start_idx, end_idx = all_gather(
+            input_ids,
+            get_tensor_model_parallel_rank(),
+            get_tensor_model_parallel_world_size(),
+        )
+
         hidden_states = self.embed_tokens(input_ids)
+        hidden_states = hidden_states[start_idx:end_idx]
+
+        # print(f"[kebao] dp={get_tensor_model_parallel_rank()} forward model 1 hidden_states:{hidden_states.shape}")
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if not forward_batch.forward_mode.is_dummy():
+            hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
@@ -646,10 +744,13 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.model = DeepseekV2Model(config, cache_config, quant_config)
-        self.lm_head = ParallelLMHead(
-            config.vocab_size, config.hidden_size, quant_config=quant_config
+        # self.lm_head = ParallelLMHead(
+        #     config.vocab_size, config.hidden_size, quant_config=quant_config
+        # )
+        self.lm_head = ReplicatedLinear(
+            config.hidden_size, config.vocab_size, bias=False, quant_config=quant_config
         )
-        self.logits_processor = LogitsProcessor(config)
+        self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
 
     @torch.no_grad()
     def forward(
@@ -658,7 +759,13 @@ class DeepseekV2ForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if forward_batch.forward_mode.is_dummy():
+            input_ids = torch.zeros(0, dtype=torch.int32, device="cuda")
+        # print(f"[kebao] dp={get_tensor_model_parallel_rank()} forward model")
         hidden_states = self.model(input_ids, positions, forward_batch)
+        # print(f"[kebao] dp={get_tensor_model_parallel_rank()} done hidden_states: {hidden_states.shape}")
+        if forward_batch.forward_mode.is_dummy():
+            return
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, forward_batch
         )

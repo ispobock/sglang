@@ -49,6 +49,9 @@ from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
+from sglang.srt.managers.data_tensor_parallel_controller import (
+    run_data_tensor_parallel_controller_process,
+)
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
@@ -376,7 +379,7 @@ def launch_engine(
         reader, writer = mp.Pipe(duplex=False)
         scheduler_pipe_readers = [reader]
         proc = mp.Process(
-            target=run_data_parallel_controller_process,
+            target=run_data_tensor_parallel_controller_process,
             args=(server_args, port_args, writer),
         )
         proc.start()

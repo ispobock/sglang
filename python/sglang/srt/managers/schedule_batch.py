@@ -860,6 +860,9 @@ class ScheduleBatch:
         # Reset the encoder cached status
         self.encoder_cached = [True] * len(self.reqs)
 
+    def prepare_for_dummy(self):
+        self.forward_mode = ForwardMode.DUMMY
+
     def prepare_for_decode(self, enable_overlap: bool = False):
         self.forward_mode = ForwardMode.DECODE
 
@@ -972,20 +975,21 @@ class ScheduleBatch:
         self.has_regex = self.has_regex or other.has_regex
 
     def get_model_worker_batch(self):
-        if self.forward_mode.is_decode():
+        if self.forward_mode.is_decode() or self.forward_mode.is_dummy():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
             extend_seq_lens = self.extend_lens
             extend_prefix_lens = self.prefix_lens
             extend_logprob_start_lens = self.extend_logprob_start_lens
 
-        if self.has_regex:
-            self.sampling_info.regex_fsms = [req.regex_fsm for req in self.reqs]
-            self.sampling_info.regex_fsm_states = [
-                req.regex_fsm_state for req in self.reqs
-            ]
-        else:
-            self.sampling_info.regex_fsms = None
+        if not self.forward_mode.is_dummy():
+            if self.has_regex:
+                self.sampling_info.regex_fsms = [req.regex_fsm for req in self.reqs]
+                self.sampling_info.regex_fsm_states = [
+                    req.regex_fsm_state for req in self.reqs
+                ]
+            else:
+                self.sampling_info.regex_fsms = None
 
         global bid
         bid += 1

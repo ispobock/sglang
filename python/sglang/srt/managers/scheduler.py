@@ -26,6 +26,7 @@ from typing import List, Optional, Union
 
 import torch
 import zmq
+from vllm.distributed import get_tp_group
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
@@ -108,15 +109,19 @@ class Scheduler:
         # Init inter-process communication
         context = zmq.Context(2)
 
-        if self.tp_rank == 0:
-            self.recv_from_tokenizer = context.socket(zmq.PULL)
-            self.recv_from_tokenizer.bind(f"ipc://{port_args.scheduler_input_ipc_name}")
+        # if self.tp_rank == 0:
+        self.recv_from_tokenizer = context.socket(zmq.PULL)
+        self.recv_from_tokenizer.bind(f"ipc://{port_args.scheduler_input_ipc_name}")
 
-            self.send_to_detokenizer = context.socket(zmq.PUSH)
-            self.send_to_detokenizer.connect(f"ipc://{port_args.detokenizer_ipc_name}")
-        else:
-            self.recv_from_tokenizer = None
-            self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
+        print(
+            f"[kebao] TP={self.tp_rank} DP={dp_rank} scheduler_input_ipc_name: {port_args.scheduler_input_ipc_name}"
+        )
+
+        self.send_to_detokenizer = context.socket(zmq.PUSH)
+        self.send_to_detokenizer.connect(f"ipc://{port_args.detokenizer_ipc_name}")
+        # else:
+        #     self.recv_from_tokenizer = None
+        #     self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
         # Init tokenizer
         self.model_config = ModelConfig(
@@ -277,24 +282,36 @@ class Scheduler:
 
             batch = self.get_next_batch_to_run()
 
+            check_dp_batch = self.has_dp_batch_run(batch)
+
+            if check_dp_batch and batch is None:
+                # print(f"[kebao] rank={self.tp_rank} make dummy batch")
+                batch = self.get_dp_dummy_batch()
+
             if batch:
                 result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
+                if not batch.forward_mode.is_dummy():
+                    self.process_batch_result(batch, result)
+                else:
+                    self.check_memory()
+                    self.new_token_ratio = global_config.init_new_token_ratio
 
                 # Decode multiple steps to reduce the overhead
-                if batch.forward_mode.is_decode():
-                    for _ in range(self.server_args.num_continuous_decode_steps - 1):
-                        if not self.running_batch:
-                            break
-                        self.update_running_batch()
-                        if not self.running_batch:
-                            break
-                        result = self.run_batch(batch)
-                        self.process_batch_result(batch, result)
+                # if batch.forward_mode.is_decode():
+                #     for _ in range(self.server_args.num_continuous_decode_steps - 1):
+                #         if not self.running_batch:
+                #             break
+                #         self.update_running_batch()
+                #         if not self.running_batch:
+                #             break
+                #         result = self.run_batch(batch)
+                #         self.process_batch_result(batch, result)
             else:
                 self.check_memory()
                 self.new_token_ratio = global_config.init_new_token_ratio
 
+            if batch and batch.forward_mode.is_dummy():
+                continue
             self.last_batch = batch
 
     @torch.inference_mode()
@@ -324,21 +341,43 @@ class Scheduler:
 
             self.last_batch = batch
 
+    def has_dp_batch_run(self, local_batch):
+        local_value = torch.tensor(
+            [1 if local_batch is not None else 0], dtype=torch.int32
+        ).cuda()
+        torch.distributed.all_reduce(
+            local_value,
+            op=torch.distributed.ReduceOp.MAX,
+            group=get_tp_group().device_group,
+        )
+        return local_value.item() == 1
+
+    def get_dp_dummy_batch(self):
+        dummy_batch = ScheduleBatch.init_new(
+            [],
+            self.req_to_token_pool,
+            self.token_to_kv_pool,
+            self.tree_cache,
+            self.model_config,
+        )
+        dummy_batch.prepare_for_dummy()
+        return dummy_batch
+
     def recv_requests(self):
-        if self.tp_rank == 0:
-            recv_reqs = []
+        # if self.tp_rank == 0:
+        recv_reqs = []
 
-            while True:
-                try:
-                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                except zmq.ZMQError:
-                    break
-                recv_reqs.append(recv_req)
-        else:
-            recv_reqs = None
+        while True:
+            try:
+                recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+            except zmq.ZMQError:
+                break
+            recv_reqs.append(recv_req)
+        # else:
+        #     recv_reqs = None
 
-        if self.tp_size != 1:
-            recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
+        # if self.tp_size != 1:
+        #     recv_reqs = broadcast_pyobj(recv_reqs, self.tp_rank, self.tp_cpu_group)
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
@@ -722,11 +761,19 @@ class Scheduler:
     def run_batch(self, batch: ScheduleBatch):
         """Run a batch."""
         if self.is_generation:
-            if batch.forward_mode.is_decode() or batch.extend_num_tokens != 0:
+            if batch.forward_mode.is_decode() or (
+                batch.extend_num_tokens is not None and batch.extend_num_tokens != 0
+            ):
+                # print(f"[kebao] dp={self.tp_rank} run a decode or extend batch: {batch}")
                 model_worker_batch = batch.get_model_worker_batch()
                 logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
                     model_worker_batch
                 )
+            elif batch.forward_mode.is_dummy():
+                # print(f"[kebao] dp={self.tp_rank} run a dummy batch: {batch}")
+                model_worker_batch = batch.get_model_worker_batch()
+                self.tp_worker.forward_batch_dummy(model_worker_batch)
+                return
             else:
                 logits_output = None
                 if self.tokenizer is not None:

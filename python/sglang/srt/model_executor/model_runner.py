@@ -171,6 +171,7 @@ class ModelRunner:
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
         # Init torch distributed
+        print(f"[kebao] gpu_id: {self.gpu_id}")
         if self.device == "cuda":
             torch.cuda.set_device(self.gpu_id)
             backend = "nccl"
@@ -187,6 +188,9 @@ class ModelRunner:
         else:
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
+        print(
+            f"[kebao] tp_size: {self.tp_size} tp_rank: {self.tp_rank} dist_init_method: {dist_init_method}"
+        )
         init_distributed_environment(
             backend=backend,
             world_size=self.tp_size,
@@ -586,6 +590,10 @@ class ModelRunner:
             return self.forward_decode(forward_batch)
         elif forward_batch.forward_mode.is_extend():
             return self.forward_extend(forward_batch)
+        elif forward_batch.forward_mode.is_dummy():
+            return self.model.forward(
+                forward_batch.input_ids, forward_batch.positions, forward_batch
+            )
         else:
             raise ValueError(f"Invaid forward mode: {forward_batch.forward_mode}")
 
