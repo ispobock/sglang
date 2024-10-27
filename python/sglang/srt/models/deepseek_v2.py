@@ -499,9 +499,9 @@ def all_gather(input_tensor: torch.Tensor, rank, world_size):
 
     # print(f"[kebao] rank: {get_tensor_model_parallel_rank()} start all gather input:{input_tensor.size(0)} {input_tensor.device}")
 
-    local_len = torch.tensor(
-        [input_tensor.size(0)], dtype=torch.int64, device=input_tensor.device
-    )
+    # print(f"[kebao] rank: {get_tensor_model_parallel_rank()} size: {input_tensor.size(0)}")
+    seq_len = input_tensor.size(0)
+    local_len = torch.tensor([seq_len], dtype=torch.int32).cuda()
     all_lens = [torch.zeros_like(local_len) for _ in range(world_size)]
 
     # print(f"[kebao] rank: {get_tensor_model_parallel_rank()} local_len: {local_len}")
@@ -513,6 +513,8 @@ def all_gather(input_tensor: torch.Tensor, rank, world_size):
     max_len = max(l.item() for l in all_lens)
     all_lens = [l.item() for l in all_lens]
 
+    # print(f"[kebao] rank: {get_tensor_model_parallel_rank()} input_tensor_dtype: {input_tensor.dtype}")
+
     if len(input_tensor.size()) == 1:
         padded_tensor = torch.nn.functional.pad(
             input_tensor, (0, max_len - input_tensor.shape[0])
@@ -522,7 +524,7 @@ def all_gather(input_tensor: torch.Tensor, rank, world_size):
             input_tensor, (0, 0, 0, max_len - input_tensor.shape[0])
         )
 
-    # print(f"[kebao] rank: {get_tensor_model_parallel_rank()} padded_tensor: {padded_tensor.shape}")
+    # print(f"[kebao] rank: {get_tensor_model_parallel_rank()} padded_tensor: {padded_tensor.shape} {padded_tensor.dtype}")
 
     output_tensors = [torch.zeros_like(padded_tensor) for _ in range(world_size)]
     torch.distributed.all_gather(
@@ -760,7 +762,9 @@ class DeepseekV2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         if forward_batch.forward_mode.is_dummy():
-            input_ids = torch.zeros(0, dtype=torch.int32, device="cuda")
+            input_ids = torch.zeros(0, dtype=torch.int64, device="cuda")
+        # print(f"stage: {forward_batch.forward_mode} input_ids type: {input_ids.dtype}")
+        input_ids = input_ids.to(torch.int64)
         # print(f"[kebao] dp={get_tensor_model_parallel_rank()} forward model")
         hidden_states = self.model(input_ids, positions, forward_batch)
         # print(f"[kebao] dp={get_tensor_model_parallel_rank()} done hidden_states: {hidden_states.shape}")
