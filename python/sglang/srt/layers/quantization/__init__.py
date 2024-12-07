@@ -149,12 +149,42 @@ def awq_get_quant_method(self, layer, prefix):
     return None
 
 
+def compressed_tensors_get_quant_method(self, layer, prefix):
+    from vllm.model_executor.layers.linear import LinearBase
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsLinearMethod,
+    )
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+        CompressedTensorsMoEMethod,
+    )
+    from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+        should_ignore_layer,
+    )
+
+    from sglang.srt.layers.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.linear import UnquantizedLinearMethod
+
+    if should_ignore_layer(prefix, ignore=self.ignore):
+        return UnquantizedLinearMethod()
+
+    if isinstance(layer, LinearBase):
+        scheme = self.get_scheme(layer=layer, layer_name=prefix)
+        layer.scheme = scheme
+        return CompressedTensorsLinearMethod(self)
+    if isinstance(layer, FusedMoE):
+        return CompressedTensorsMoEMethod.get_moe_method(self)
+    return None
+
+
 def apply_monkey_patches():
     """Apply all monkey patches in one place."""
     setattr(Fp8MoEMethod, "apply", fp8_moe_apply)
     setattr(Fp8Config, "get_quant_method", fp8_get_quant_method)
     setattr(GPTQMarlinConfig, "get_quant_method", gptq_get_quant_method)
     setattr(AWQMarlinConfig, "get_quant_method", awq_get_quant_method)
+    setattr(
+        CompressedTensorsConfig, "get_quant_method", compressed_tensors_get_quant_method
+    )
 
 
 # Apply patches when module is imported

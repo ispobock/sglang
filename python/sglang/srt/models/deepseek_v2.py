@@ -148,9 +148,13 @@ class DeepseekV2MoE(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         final_hidden_states = (
-            self.experts(hidden_states=hidden_states, router_logits=router_logits)
+            self.experts(
+                hidden_states=hidden_states.to(torch.float16),
+                router_logits=router_logits,
+            )
             * self.routed_scaling_factor
-        )
+        ).to(torch.bfloat16)
+        final_hidden_states
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1:
@@ -789,6 +793,18 @@ class DeepseekV2Model(nn.Module):
         return hidden_states
 
 
+def w4a16_dequantize(packed_tensor, scale):
+    assert packed_tensor.dtype == torch.int32
+
+    batch_size, number_of_packed_ints = packed_tensor.shape
+    unpacked = torch.zeros(
+        batch_size, number_of_packed_ints * 8, dtype=scale.dtype, device=scale.device
+    )
+    for i in range(8):
+        unpacked[:, i::8] = (packed_tensor >> (4 * i)) & 0xF
+    return unpacked * scale
+
+
 class DeepseekV2ForCausalLM(nn.Module):
 
     def __init__(
@@ -907,6 +923,12 @@ class DeepseekV2ForCausalLM(nn.Module):
                         0,
                         0,
                     ).T
+                elif hasattr(self_attn.kv_b_proj, "weight_packed"):
+                    # W4A16
+                    w = w4a16_dequantize(
+                        self_attn.kv_b_proj.weight_packed,
+                        self_attn.kv_b_proj.weight_scale,
+                    )
                 else:
                     w = self_attn.kv_b_proj.weight
                 w_kc, w_vc = w.unflatten(
