@@ -12,6 +12,8 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90")
 message(STATUS "Building for CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
+set(CUTLASS_DIR "3rdparty/cutlass")
+
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
 # Find PyTorch
@@ -29,6 +31,9 @@ add_library(warp_reduce SHARED
     src/sgl-kernel/csrc/warp_reduce.cc
     src/sgl-kernel/csrc/warp_reduce_kernel.cu
 )
+
+include_directories(${CUTLASS_DIR}/include)
+include_directories(${CUTLASS_DIR}/tools/util/include)
 
 target_include_directories(warp_reduce
     PRIVATE
