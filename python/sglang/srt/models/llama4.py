@@ -163,11 +163,8 @@ class Llama4Attention(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.hidden_size = hidden_size
-        self.no_rope_layer_interval = config.no_rope_layer_interval
-        self.nope = (
-            self.no_rope_layer_interval > 0
-            and (self.layer_id + 1) % self.no_rope_layer_interval == 0
-        )
+        self.no_rope_layers = config.no_rope_layers
+        self.nope = self.no_rope_layers[self.layer_id] == 0
         self.use_qk_norm = config.use_qk_norm and not self.nope
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
@@ -288,7 +285,7 @@ class Llama4Attention(nn.Module):
         return output
 
 
-class Llama4DecoderLayer(LlamaDecoderLayer):
+class Llama4DecoderLayer(nn.Module):
     def __init__(
         self,
         config: Llama4TextConfig,
@@ -361,7 +358,7 @@ class Llama4DecoderLayer(LlamaDecoderLayer):
         return hidden_states, residual
 
 
-class Llama4Model(LlamaModel):
+class Llama4Model(nn.Module):
     def __init__(
         self,
         config: Llama4TextConfig,
@@ -465,9 +462,11 @@ class Llama4ForCausalLM(LlamaForCausalLM):
         prefix: str = "",
     ):
         super().__init__(config, quant_config, prefix)
+        self.model = Llama4Model(
+            config=config, quant_config=quant_config, prefix=prefix
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
-        return
         # Process weights for rotary embeddings
         processed_weights = []
         for name, loaded_weight in weights:

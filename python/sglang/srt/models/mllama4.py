@@ -10,15 +10,12 @@ from transformers import BatchFeature, Llama4Config, Llama4VisionConfig
 from transformers.image_utils import SizeDict
 from transformers.modeling_outputs import BaseModelOutput
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.layers.activation import get_act_fn
-from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-
+from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -28,7 +25,11 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
+
 
 class Llama4ForConditionalGeneration(nn.Module):
     packed_modules_mapping = {
@@ -86,9 +87,6 @@ class Llama4ForConditionalGeneration(nn.Module):
         return get_prefix_weights(), get_other_weights()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
-        
-        return
-
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
@@ -102,10 +100,16 @@ class Llama4ForConditionalGeneration(nn.Module):
         # using llama4's load_weights routine.
         language_model_prefix = "language_model.model."
         language_model_weights, other_weights = self.separate_weights(
-            weights, prefix=language_model_prefix)
-        loader = AutoWeightsLoader(self)
-        loaded_language_model_params = loader.load_weights(
-            language_model_weights)
+            weights, prefix=language_model_prefix
+        )
+
+        loaded_language_model_params = []
+        for name, loaded_weight in language_model_weights:
+            if "language" in name:
+                name = name.replace("language_model.", "")
+                self.language_model.load_weights([(name, loaded_weight)])
+                loaded_language_model_params.append(name)
+
         assert loaded_language_model_params is not None
         updated_params.update(loaded_language_model_params)
 
@@ -121,11 +125,11 @@ class Llama4ForConditionalGeneration(nn.Module):
                 break
             else:
                 param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
 
                 weight_loader(param, loaded_weight)
                 updated_params.add(name)
         return updated_params
+
 
 EntryClass = Llama4ForConditionalGeneration
