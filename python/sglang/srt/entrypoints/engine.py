@@ -25,10 +25,11 @@ import multiprocessing as mp
 import os
 import signal
 import threading
-from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 
 import zmq
 import zmq.asyncio
+from msgspec.msgpack import Decoder
 from PIL.Image import Image
 
 # Fix a bug of Python threading
@@ -38,6 +39,7 @@ import torch
 import uvloop
 
 from sglang.srt.code_completion_parser import load_completion_template_for_openai_api
+from sglang.srt.disaggregation.kv_events import KVEventBatch
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
@@ -134,6 +136,14 @@ class Engine(EngineBase):
         self.send_to_rpc = get_zmq_socket(
             context, zmq.DEALER, port_args.rpc_ipc_name, True
         )
+
+        # KV event
+        context = zmq.Context()
+        self.kv_event_socket: zmq.Socket = context.socket(zmq.SUB)
+        self.kv_event_socket.connect("tcp://localhost:5557")
+        self.kv_event_socket.setsockopt_string(zmq.SUBSCRIBE, "kv-events")
+        self.kv_event_decoder = Decoder(type=KVEventBatch)
+        self.kv_event_publisher = None
 
     def generate(
         self,
@@ -263,6 +273,30 @@ class Engine(EngineBase):
             return generator
         else:
             return await generator.__anext__()
+
+    async def async_get_kv_event(
+        self, timeout: int = 5, interval: float = 1.0
+    ) -> AsyncIterator[List[Any]]:
+        try:
+            while True:
+                has_event = await asyncio.to_thread(self.kv_event_socket.poll, timeout)
+                if has_event:
+                    try:
+                        _, _, payload = await asyncio.to_thread(
+                            self.kv_event_socket.recv_multipart
+                        )
+                        event_batch = self.kv_event_decoder.decode(payload)
+                        if isinstance(event_batch, KVEventBatch):
+                            yield event_batch.events
+                    except Exception as e:
+                        logger.error(
+                            f"Receive or decode KVEventBatch error: {e}", exc_info=True
+                        )
+                else:
+                    await asyncio.sleep(interval)
+        except Exception as e:
+            logger.error(f"Error in async_get_kv_event: {e}", exc_info=True)
+            raise
 
     def encode(
         self,
