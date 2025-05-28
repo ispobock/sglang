@@ -73,7 +73,9 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, is_cuda, make_layers
+
+_is_cuda = is_cuda()
 
 logger = logging.getLogger(__name__)
 
@@ -291,6 +293,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -409,6 +412,8 @@ class Qwen2MoeModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+
         # Use the provided decoder layer type or default to Qwen2MoeDecoderLayer
         decoder_layer_type = decoder_layer_type or Qwen2MoeDecoderLayer
         self.layers, self.start_layer, self.end_layer = make_layers(
@@ -418,6 +423,7 @@ class Qwen2MoeModel(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,
+                alt_stream=self.alt_stream,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
