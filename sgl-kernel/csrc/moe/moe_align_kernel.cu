@@ -16,12 +16,106 @@ limitations under the License.
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cooperative_groups.h>
 
 #include <THC/THCAtomics.cuh>
+#include <cstdio>
 
 #include "utils.h"
 
 #define WARP_SIZE 32
+
+#if (__CUDACC_VER_MAJOR__ >= 12)
+#include <cuda/atomic>
+#define ATOMIC_ADD_BLOCK(ptr, val) \
+  cuda::atomic_ref<int, cuda::thread_scope_block>(*(ptr)).fetch_add((val), cuda::memory_order_relaxed)
+#else
+// Fallback : shared-memory atomicAdd works fine on <12.x
+#define ATOMIC_ADD_BLOCK(ptr, val) atomicAdd((ptr), (val))
+#endif
+
+namespace cg = cooperative_groups;
+
+template <typename scalar_t, int BLOCK_THREADS = 1024>
+__global__ __launch_bounds__(BLOCK_THREADS) void moe_align_sort_dsm_kernel(
+    const scalar_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids,
+    int32_t* __restrict__ expert_ids,
+    int32_t* __restrict__ total_tokens_post_pad,
+    int32_t* __restrict__ cumsum_buffer,
+    int32_t num_experts,
+    int32_t block_size,
+    int64_t numel) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cg::cluster_group cluster = cg::this_cluster();
+
+  __shared__ int32_t __attribute((aligned(128))) shared_counts[BLOCK_THREADS];
+
+  if (threadIdx.x < num_experts) {
+    shared_counts[threadIdx.x] = 0;
+  }
+
+  if (cluster.block_rank() == 0) {
+    if (threadIdx.x < num_experts + 1) {
+      cumsum_buffer[threadIdx.x] = 0;
+    }
+  }
+
+  __syncthreads();
+
+  size_t gtid = threadIdx.x + blockIdx.x * blockDim.x;
+  size_t gstride = blockDim.x * gridDim.x;
+
+  // local hist
+  for (int64_t idx = gtid; idx < numel; idx += gstride) {
+    int e = topk_ids[idx];
+    ATOMIC_ADD_BLOCK(&shared_counts[e], 1);
+  }
+  __syncthreads();
+
+  // push to global counts (one atomic per expert per block)
+  for (int e = threadIdx.x; e < num_experts; e += BLOCK_THREADS) {
+    int local_count = shared_counts[e];
+    if (local_count) {
+      atomicAdd(&cumsum_buffer[e + 1], local_count);
+    }
+  }
+  cluster.sync();
+
+  if (cluster.block_rank() == 0 && threadIdx.x == 0) {
+    for (int i = 1; i < num_experts + 1; ++i) {
+      int cnt = cumsum_buffer[i];
+      int padded = CEILDIV(cnt, block_size) * block_size;
+      cumsum_buffer[i] = cumsum_buffer[i - 1] + padded;
+    }
+    *total_tokens_post_pad = cumsum_buffer[num_experts];
+  }
+
+  cluster.sync();
+
+  // fill expert_ids
+  for (int e = gtid; e < num_experts; e += gstride) {
+    for (int i = cumsum_buffer[e]; i < cumsum_buffer[e + 1]; i += block_size) {
+      expert_ids[i / block_size] = e;
+    }
+  }
+
+  // init sorted_token_ids
+  int32_t fill_val = static_cast<int32_t>(numel);
+  for (int64_t i = gtid; i < *total_tokens_post_pad; i += gstride) {
+    sorted_token_ids[i] = fill_val;
+  }
+
+  cluster.sync();
+
+  // fill sorted token ids
+  for (size_t idx = gtid; idx < numel; idx += gstride) {
+    int32_t expert_id = topk_ids[idx];
+    int32_t pos = atomicAdd(&cumsum_buffer[expert_id], 1);
+    sorted_token_ids[pos] = idx;
+  }
+#endif
+}
 
 template <typename scalar_t>
 __global__ void count_and_sort_expert_tokens_kernel(
@@ -171,6 +265,54 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
   }
 }
 
+template <typename scalar_t>
+void launch_moe_align_sort_kernel(
+    const scalar_t* d_topk,
+    int32_t* d_sorted_token_ids,
+    int32_t* d_expert_ids,
+    int32_t* d_total_tokens_post_pad,
+    int32_t* d_cumsum_buffer,
+    int num_experts,
+    int block_size,
+    int64_t numel,
+    cudaStream_t stream = 0) {
+  constexpr int CLUSTER_SZ = 8;
+  constexpr int BLOCK_THREADS = 1024;
+  using KernelPtr = void (*)(const scalar_t*, int32_t*, int32_t*, int32_t*, int32_t*, int32_t, int32_t, int64_t);
+
+  KernelPtr kernel = moe_align_sort_dsm_kernel<scalar_t, BLOCK_THREADS>;
+
+  // config gridDim
+  dim3 grid(CLUSTER_SZ);
+  dim3 block(BLOCK_THREADS);
+
+  // cooperative launch
+  cudaFuncSetAttribute((void*)kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+
+#if defined(cudaFuncAttributePreferredClusterSize)  // CUDA ≥ 12.4
+  cudaFuncSetAttribute((void*)kernel, cudaFuncAttributePreferredClusterSize, CLUSTER_SZ);
+#else  // CUDA ≤ 12.3
+  cudaFuncSetAttribute((void*)kernel, cudaFuncAttributeRequiredClusterWidth, CLUSTER_SZ);
+  cudaFuncSetAttribute((void*)kernel, cudaFuncAttributeRequiredClusterHeight, 1);
+  cudaFuncSetAttribute((void*)kernel, cudaFuncAttributeRequiredClusterDepth, 1);
+#endif
+
+  size_t shm_size = num_experts * sizeof(int);
+  void* args[] = {
+      const_cast<scalar_t**>(&d_topk),
+      &d_sorted_token_ids,
+      &d_expert_ids,
+      &d_total_tokens_post_pad,
+      &d_cumsum_buffer,
+      &num_experts,
+      &block_size,
+      &numel};
+
+  cudaError_t st = cudaLaunchCooperativeKernel((void*)kernel, grid, block, args, shm_size, stream);
+
+  assert(st == cudaSuccess && "cudaLaunchCooperativeKernel failed (check cluster config & resources)");
+}
+
 void moe_align_block_size(
     torch::Tensor topk_ids,
     int64_t num_experts,
@@ -206,34 +348,45 @@ void moe_align_block_size(
           block_size,
           topk_ids.numel());
     } else {
-      auto align_kernel = moe_align_block_size_kernel<scalar_t>;
+      // auto align_kernel = moe_align_block_size_kernel<scalar_t>;
 
-      size_t num_warps = CEILDIV(padded_num_experts, experts_per_warp);
-      size_t shared_mem_size = num_warps * experts_per_warp * sizeof(int32_t);
+      // size_t num_warps = CEILDIV(padded_num_experts, experts_per_warp);
+      // size_t shared_mem_size = num_warps * experts_per_warp * sizeof(int32_t);
 
-      align_kernel<<<1, threads, shared_mem_size, stream>>>(
+      // align_kernel<<<1, threads, shared_mem_size, stream>>>(
+      //     topk_ids.data_ptr<scalar_t>(),
+      //     sorted_token_ids.data_ptr<int32_t>(),
+      //     experts_ids.data_ptr<int32_t>(),
+      //     num_tokens_post_pad.data_ptr<int32_t>(),
+      //     num_experts,
+      //     padded_num_experts,
+      //     experts_per_warp,
+      //     block_size,
+      //     topk_ids.numel(),
+      //     cumsum_buffer.data_ptr<int32_t>());
+
+      // const int block_threads = std::min(256, (int)threads);
+      // const int num_blocks = (topk_ids.numel() + block_threads - 1) / block_threads;
+      // const int max_blocks = 65535;
+      // const int actual_blocks = std::min(num_blocks, max_blocks);
+
+      // auto sort_kernel = count_and_sort_expert_tokens_kernel<scalar_t>;
+      // sort_kernel<<<actual_blocks, block_threads, 0, stream>>>(
+      //     topk_ids.data_ptr<scalar_t>(),
+      //     sorted_token_ids.data_ptr<int32_t>(),
+      //     cumsum_buffer.data_ptr<int32_t>(),
+      //     topk_ids.numel());
+
+      launch_moe_align_sort_kernel<scalar_t>(
           topk_ids.data_ptr<scalar_t>(),
           sorted_token_ids.data_ptr<int32_t>(),
           experts_ids.data_ptr<int32_t>(),
           num_tokens_post_pad.data_ptr<int32_t>(),
+          cumsum_buffer.data_ptr<int32_t>(),
           num_experts,
-          padded_num_experts,
-          experts_per_warp,
           block_size,
           topk_ids.numel(),
-          cumsum_buffer.data_ptr<int32_t>());
-
-      const int block_threads = std::min(256, (int)threads);
-      const int num_blocks = (topk_ids.numel() + block_threads - 1) / block_threads;
-      const int max_blocks = 65535;
-      const int actual_blocks = std::min(num_blocks, max_blocks);
-
-      auto sort_kernel = count_and_sort_expert_tokens_kernel<scalar_t>;
-      sort_kernel<<<actual_blocks, block_threads, 0, stream>>>(
-          topk_ids.data_ptr<scalar_t>(),
-          sorted_token_ids.data_ptr<int32_t>(),
-          cumsum_buffer.data_ptr<int32_t>(),
-          topk_ids.numel());
+          stream);
     }
   });
 }

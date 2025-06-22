@@ -266,9 +266,9 @@ def get_topk_ids(num_tokens: int, num_experts: int, topk: int) -> torch.Tensor:
         x_names=["num_tokens", "num_experts", "topk"],
         x_vals=configs,
         line_arg="provider",
-        line_vals=["sgl", "triton", "vllm"],
-        line_names=["SGL", "Triton", "VLLM"],
-        styles=[("blue", "-"), ("red", "-"), ("green", "-")],
+        line_vals=["sgl", "triton"],
+        line_names=["SGL", "Triton"],
+        styles=[("blue", "-"), ("red", "-")],
         ylabel="us",
         plot_name="moe-align-block-size-performance",
         args={},
@@ -353,24 +353,24 @@ def benchmark(num_tokens, num_experts, topk, provider):
             ),
             quantiles=quantiles,
         )
-    else:  # vllm
-        try:
-            sorted_ids.fill_(topk_ids.numel())
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: ops.moe_align_block_size(
-                    topk_ids,
-                    num_experts,
-                    block_size,
-                    sorted_ids.clone(),
-                    expert_ids.clone(),
-                    num_tokens_post_pad.clone(),
-                ),
-                quantiles=quantiles,
-            )
-        except Exception as e:
-            print(f"❌ VLLM benchmark failed with {num_experts} experts: {e}")
-            # Return extreme values to indicate failure in the chart
-            return float("inf"), float("inf"), float("inf")
+    # else:  # vllm
+    #     try:
+    #         sorted_ids.fill_(topk_ids.numel())
+    #         ms, min_ms, max_ms = triton.testing.do_bench(
+    #             lambda: ops.moe_align_block_size(
+    #                 topk_ids,
+    #                 num_experts,
+    #                 block_size,
+    #                 sorted_ids.clone(),
+    #                 expert_ids.clone(),
+    #                 num_tokens_post_pad.clone(),
+    #             ),
+    #             quantiles=quantiles,
+    #         )
+    #     except Exception as e:
+    #         print(f"❌ VLLM benchmark failed with {num_experts} experts: {e}")
+    #         # Return extreme values to indicate failure in the chart
+    #         return float("inf"), float("inf"), float("inf")
 
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
