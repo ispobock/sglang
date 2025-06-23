@@ -252,3 +252,7 @@ def cutlass_fp4_group_mm(
         params["blockscale_offsets"],
     )
     return c.to(dtype=out_dtype)
+
+
+def moe_sum_reduce(input, output, scaling_factor):
+    torch.ops.sgl_kernel.moe_sum_reduce.default(input, output, scaling_factor)

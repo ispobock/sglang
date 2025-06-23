@@ -202,6 +202,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, Tensor? factors) -> ()");
   m.impl("apply_shuffle_mul_sum", torch::kCUDA, &apply_shuffle_mul_sum);
 
+  m.def("moe_sum_reduce(Tensor input, Tensor! output, float scaling_factor) -> ()");
+  m.impl("moe_sum_reduce", torch::kCUDA, &moe_sum_reduce);
+
   /*
    * From csrc/speculative
    */

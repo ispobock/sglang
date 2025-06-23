@@ -290,6 +290,8 @@ void ep_moe_post_reorder(
     int64_t end_expert_id,
     int64_t topk);
 
+void moe_sum_reduce(const torch::Tensor& input, torch::Tensor& output, double scaling_factor);
+
 void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor);
 
 void apply_shuffle_mul_sum(

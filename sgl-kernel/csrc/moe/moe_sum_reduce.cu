@@ -3,12 +3,13 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 #include <cutlass/array.h>
+#include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <torch/all.h>
 
 template <typename T, int VEC_SIZE>
-__global__ void
-moe_sum_reduce_kernel(const T* __restrict__ input, T* __restrict__ output, int M, int TOP_K, int DIM, float scaling) {
+__global__ void moe_sum_reduce_kernel(
+    const T* __restrict__ input, T* __restrict__ output, size_t M, size_t TOP_K, size_t DIM, float scaling_factor) {
   using Vec = cutlass::AlignedArray<T, VEC_SIZE>;
   using ToFloat = cutlass::NumericConverter<float, T>;
   using ToElem = cutlass::NumericConverter<T, float>;
@@ -33,7 +34,7 @@ moe_sum_reduce_kernel(const T* __restrict__ input, T* __restrict__ output, int M
 
 #pragma unroll
   for (int i = 0; i < VEC_SIZE; ++i) {
-    acc[i] *= scaling;
+    acc[i] *= scaling_factor;
   }
 
   Vec* out_vec = reinterpret_cast<Vec*>(output + m * DIM);
@@ -48,30 +49,17 @@ moe_sum_reduce_kernel(const T* __restrict__ input, T* __restrict__ output, int M
 }
 
 template <typename T, int VEC_SIZE>
-void launch_moe_sum_reduce_kernel(const T* in, T* out, int M, int TOP_K, int DIM, float scaling, cudaStream_t stream) {
+void launch_moe_sum_reduce_kernel(const T* in, T* out, size_t M, size_t TOP_K, size_t DIM, float scaling_factor) {
   constexpr int THREADS = 128;
   dim3 block(THREADS);
   dim3 grid(M, (DIM / VEC_SIZE + THREADS - 1) / THREADS);
 
-  moe_sum_reduce_kernel<T, VEC_SIZE><<<grid, block, 0, stream>>>(in, out, M, TOP_K, DIM, scaling);
-}
-
-template <typename T>
-void dispatch_type(torch::Tensor& in, torch::Tensor& out, float scaling) {
-  int M = in.size(0);
-  int TOP_K = in.size(1);
-  int DIM = in.size(2);
-  static constexpr int VEC_SIZE = 4;
-
-  const T* in_ptr = in.data_ptr<T>();
-  T* out_ptr = out.data_ptr<T>();
-
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  launch_moe_sum_reduce_kernel<T, VEC_SIZE>(in_ptr, out_ptr, M, TOP_K, DIM, scaling, stream);
+  moe_sum_reduce_kernel<T, VEC_SIZE><<<grid, block, 0, stream>>>(in, out, M, TOP_K, DIM, scaling_factor);
 }
 
-void moe_sum_reduce_launcher(torch::Tensor input, torch::Tensor output, float scaling) {
+void moe_sum_reduce(const torch::Tensor& input, torch::Tensor& output, double scaling_factor) {
   TORCH_CHECK(input.device().is_cuda(), "input must be CUDA tensor");
   TORCH_CHECK(output.device().is_cuda(), "output must be CUDA tensor");
   TORCH_CHECK(
@@ -84,10 +72,27 @@ void moe_sum_reduce_launcher(torch::Tensor input, torch::Tensor output, float sc
   TORCH_CHECK(input.size(2) == output.size(1), "DIM mismatch");
   TORCH_CHECK(input.is_contiguous() && output.is_contiguous(), "Need contiguous");
 
+  size_t M = input.size(0);
+  size_t TOP_K = input.size(1);
+  size_t DIM = input.size(2);
+  static constexpr int VEC_SIZE = 4;
+
   if (input.scalar_type() == at::ScalarType::Half) {
-    dispatch_type<cutlass::half_t>(input, output, scaling);
+    launch_moe_sum_reduce_kernel<cutlass::half_t, VEC_SIZE>(
+        reinterpret_cast<const cutlass::half_t*>(input.data_ptr<at::Half>()),
+        reinterpret_cast<cutlass::half_t*>(output.data_ptr<at::Half>()),
+        M,
+        TOP_K,
+        DIM,
+        static_cast<float>(scaling_factor));
   } else if (input.scalar_type() == at::ScalarType::BFloat16) {
-    dispatch_type<cutlass::bfloat16_t>(input, output, scaling);
+    launch_moe_sum_reduce_kernel<cutlass::bfloat16_t, VEC_SIZE>(
+        reinterpret_cast<const cutlass::bfloat16_t*>(input.data_ptr<at::BFloat16>()),
+        reinterpret_cast<cutlass::bfloat16_t*>(output.data_ptr<at::BFloat16>()),
+        M,
+        TOP_K,
+        DIM,
+        static_cast<float>(scaling_factor));
   } else {
     TORCH_CHECK(false, "Unsupported input dtype");
   }
