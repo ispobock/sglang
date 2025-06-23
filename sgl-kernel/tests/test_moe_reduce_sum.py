@@ -25,7 +25,7 @@ def moe_sum_reduce_torch(
         )
     ),
 )
-def test_topk_softmax(num_tokens, topk, dim, scaling_factor, dtype):
+def test_moe_reduce_sum(num_tokens, topk, dim, scaling_factor, dtype):
 
     input_tensor = torch.randn((num_tokens, topk, dim), dtype=dtype, device="cuda")
     out_sgl_kernel = torch.empty((num_tokens, dim), dtype=dtype, device="cuda")
