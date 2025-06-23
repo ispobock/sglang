@@ -41,7 +41,7 @@ def get_benchmark():
         )
     )
     def benchmark(num_tokens, version):
-        topk = 8
+        topk = 9
         hidden_size = 4096
         dtype = torch.bfloat16
         scaling_factor = 0.3
