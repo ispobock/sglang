@@ -419,15 +419,19 @@ class EAGLEWorker(TpModelWorker):
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            print("forward target extend")
             logits_output, next_token_ids, bid, seq_lens_cpu = (
                 self.forward_target_extend(batch)
             )
+            print("forward draft extend")
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 self.forward_draft_extend(
                     batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
                 )
+            print(f"after forward draft extend req_to_token: {batch.req_to_token_pool.req_to_token}", flush=True)
             return logits_output, next_token_ids, bid, 0, False
         else:
+            print(f"forward mode: {batch.forward_mode=}", flush=True)
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(batch)
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
@@ -485,6 +489,7 @@ class EAGLEWorker(TpModelWorker):
         """
         # Forward with the target model and get hidden states.
         # We need the full hidden states to prefill the KV cache of the draft model.
+        print(f"forward target extend req_to_token_pool: {batch.req_to_token_pool.req_to_token}", flush=True)
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         logits_output, next_token_ids, _ = self.target_worker.forward_batch_generation(
@@ -611,6 +616,8 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def draft(self, batch: ScheduleBatch):
+        print("start draft", flush=True)
+        print(f"draft req_to_token_pool: {batch.req_to_token_pool.req_to_token}", flush=True)
         # Parse args
         if batch.forward_mode.is_idle():
             self._draft_preprocess_idle(batch)
@@ -645,6 +652,9 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
             # Run forward steps
             score_list, token_list, parents_list = self.draft_forward(forward_batch)
+            print(f"score_list: {score_list}", flush=True)
+            print(f"token_list: {token_list}", flush=True)
+            print(f"parents_list: {parents_list}", flush=True)
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -735,9 +745,12 @@ class EAGLEWorker(TpModelWorker):
             spec_info.hidden_states = hidden_states
 
             # Run forward
+            print(f"forward_batch {forward_batch.input_ids}", flush=True)
             logits_output, _ = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             )
+            print(f"logits_output {logits_output}", flush=True)
+
             self._detect_nan_if_needed(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
@@ -748,6 +761,8 @@ class EAGLEWorker(TpModelWorker):
         return score_list, token_list, parents_list
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
+        print("start verify", flush=True)
+        print(f"verify req_to_token_pool: {batch.req_to_token_pool.req_to_token}", flush=True)
         spec_info.prepare_for_verify(batch, self.page_size)
         batch.return_hidden_states = False
         batch.forward_mode = (
@@ -917,6 +932,7 @@ class EAGLEWorker(TpModelWorker):
             hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        print(f"forward draft extend req_to_token_pool: {batch.req_to_token_pool.req_to_token}", flush=True)
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=next_token_ids,

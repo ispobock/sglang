@@ -49,6 +49,7 @@ class SchedulerOutputProcessorMixin:
                 result.extend_input_len_per_req,
                 result.extend_logprob_start_len_per_req,
             )
+            print(f"batch 1 : {batch.req_to_token_pool.req_to_token}", flush=True)
 
             if self.enable_overlap:
                 logits_output, next_token_ids, _ = (
@@ -66,6 +67,7 @@ class SchedulerOutputProcessorMixin:
                         logits_output.input_token_logprobs = tuple(
                             logits_output.input_token_logprobs.tolist()
                         )
+            print(f"batch 2 : {batch.req_to_token_pool.req_to_token}", flush=True)
 
             hidden_state_offset = 0
 
@@ -81,17 +83,26 @@ class SchedulerOutputProcessorMixin:
                     self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
                     continue
 
+                print(f"batch 2.1 : {batch.req_to_token_pool.req_to_token}", flush=True)
+
                 if req.is_chunked <= 0:
+                    print("not chunked", flush=True)
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
                     req.check_finished()
 
+                    print(f"batch 2.2 : {batch.req_to_token_pool.req_to_token}", flush=True)
+
                     if req.finished():
+                        print("cache finished req", flush=True)
                         self.tree_cache.cache_finished_req(req)
                         req.time_stats.completion_time = time.time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
+                        print("cache unfinished req", flush=True)
                         self.tree_cache.cache_unfinished_req(req)
+                    
+                    print(f"batch 2.3 : {batch.req_to_token_pool.req_to_token}", flush=True)
 
                     if batch.return_logprob:
                         assert extend_logprob_start_len_per_req is not None
@@ -139,6 +150,7 @@ class SchedulerOutputProcessorMixin:
                             self.abort_request(AbortReq(req.rid))
                         req.grammar.finished = req.finished()
                 else:
+                    print("chunked", flush=True)
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
                     # There is only at most one request being currently chunked.
@@ -165,6 +177,8 @@ class SchedulerOutputProcessorMixin:
                                     last_prefill_chunk=False,
                                 )
                             logprob_pt += num_input_logprobs
+            
+            print(f"batch 3 : {batch.req_to_token_pool.req_to_token}", flush=True)
 
             self.set_next_batch_sampling_info_done(batch)
 

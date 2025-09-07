@@ -169,6 +169,10 @@ class SchedulePolicy:
             r.prefix_indices, r.last_node, r.last_host_node, r.host_hit_length = (
                 self.tree_cache.match_prefix(rid=r.rid, key=prefix_ids)
             )
+            if len(r.prefix_indices) > 0:
+                print(f"r.prefix_indices: {r.prefix_indices}")
+                r.prefix_indices = r.prefix_indices[:-1]
+                print(f"r.prefix_indices: {r.prefix_indices}")
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from

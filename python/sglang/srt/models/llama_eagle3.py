@@ -143,10 +143,16 @@ class LlamaModel(nn.Module):
             embeds = self.embed_tokens(input_ids)
         else:
             embeds = input_embeds
+        
+        print(f"embeds: {embeds} shape: {embeds.shape}", flush=True)
+        print(f"hidden_states in spec info: {forward_batch.spec_info.hidden_states} shape: {forward_batch.spec_info.hidden_states.shape}", flush=True)
 
         hidden_states = forward_batch.spec_info.hidden_states
         if hidden_states.shape[-1] != embeds.shape[-1]:
             hidden_states = self.fc(hidden_states)
+
+        print(f"before midlayer:", flush=True)
+        print(f"hidden_states: {hidden_states} shape: {hidden_states.shape} positions: {positions}", flush=True)
 
         residual = None
         hidden_states, residual = self.midlayer(
@@ -156,6 +162,9 @@ class LlamaModel(nn.Module):
             forward_batch,
             residual,
         )
+
+        print(f"after midlayer:", flush=True)
+        print(f"hidden_states: {hidden_states} shape: {hidden_states.shape}", flush=True)
 
         hidden_states_to_logits, hidden_states_to_aux = self.norm(
             hidden_states, residual

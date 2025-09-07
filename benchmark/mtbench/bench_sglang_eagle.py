@@ -73,6 +73,7 @@ def main(args):
         arguments,
         temperature=0,
         max_new_tokens=2048,
+        top_k=1,
         num_threads=args.parallel,
         progress_bar=True,
     )

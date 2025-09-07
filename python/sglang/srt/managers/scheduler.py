@@ -795,7 +795,9 @@ class Scheduler(
 
             if batch:
                 result = self.run_batch(batch)
+                print(f"batch before process, req_to_token: {batch.req_to_token_pool.req_to_token}", flush=True)
                 self.process_batch_result(batch, result)
+                print(f"batch after process, req_to_token: {batch.req_to_token_pool.req_to_token}", flush=True)
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -1523,6 +1525,10 @@ class Scheduler(
             # chunked request keeps its rid but will get a new req_pool_idx
             self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
         if self.last_batch and self.last_batch.forward_mode.is_extend():
+            if self.last_batch is not None and len(self.last_batch.reqs) > 0:
+                print(f"has last batch, forward mode: {self.last_batch.forward_mode=}", flush=True)
+                print(f"last batch req_to_token: {self.last_batch.req_to_token_pool.req_to_token}", flush=True)
+
             if self.last_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
@@ -1540,10 +1546,16 @@ class Scheduler(
             # For prefill-only batch, we can avoid going through decoding step.
             if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
                 if self.running_batch.is_empty():
+                    print("use last batch", flush=True)
                     self.running_batch = self.last_batch
                 else:
+                    print("merge batch", flush=True)
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
+
+        if self.running_batch is not None and len(self.running_batch.reqs) > 0:
+            print("has running batch", flush=True)
+            print(f"running batch req_to_token: {self.running_batch.req_to_token_pool.req_to_token}", flush=True)
 
         new_batch = self.get_new_batch_prefill()
 
@@ -1574,6 +1586,10 @@ class Scheduler(
             ):
                 self.handle_dp_balance_data(ret)
             ret = self.prepare_mlp_sync_batch(ret)
+
+        if ret is not None and len(ret.reqs) > 0:
+            print("has next batch", flush=True)
+            print(f"next batch req_to_token: {ret.req_to_token_pool.req_to_token}", flush=True)
 
         return ret
 
@@ -1789,6 +1805,7 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
+            print("run batch")
             if self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
 

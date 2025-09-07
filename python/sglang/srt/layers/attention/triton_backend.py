@@ -744,6 +744,14 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
             window_kv_offsets = None
+        if layer.layer_id == 0:
+            print(f"forward_mode: {forward_batch.forward_mode=}")
+            print(f"extend q: {q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)}, shape {q.view(-1, layer.tp_q_head_num, layer.qk_head_dim).shape}", flush=True)
+            print(f"extend k: {k.contiguous()}, shape {k.contiguous().shape}", flush=True)
+            print(f"extend k_buffer: {forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)}, shape {forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).shape}", flush=True)
+            print(f"extend qo_indptr: {self.forward_metadata.qo_indptr}, shape {self.forward_metadata.qo_indptr.shape}", flush=True)
+            print(f"extend kv_indptr: {kv_indptr}, shape {kv_indptr.shape}", flush=True)
+            print(f"extend kv_indices: {kv_indices}, shape {kv_indices.shape}", flush=True)
 
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -766,6 +774,8 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_offsets=window_kv_offsets,
             xai_temperature_len=layer.xai_temperature_len,
         )
+        if layer.layer_id == 0:
+            print(f"extend o: {o}, shape: {o.shape}", flush=True)
         return o
 
     def forward_decode(
@@ -801,6 +811,9 @@ class TritonAttnBackend(AttentionBackend):
         else:
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
+        
+        if forward_batch.forward_mode.is_decode():
+            print(f"q: {q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)}", flush=True)
 
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -818,6 +831,8 @@ class TritonAttnBackend(AttentionBackend):
             sinks=sinks,
             xai_temperature_len=layer.xai_temperature_len,
         )
+        if forward_batch.forward_mode.is_decode():
+            print(f"o: {o}", flush=True)
         return o
 
 

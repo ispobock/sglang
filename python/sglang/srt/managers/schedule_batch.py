@@ -655,6 +655,15 @@ class Req:
                 ) = tree_cache.match_prefix(
                     key=self.adjust_max_prefix_ids(),
                 )
+        if len(self.prefix_indices) > 0:
+            print(f"prefix indices: {self.prefix_indices}", flush=True)
+            self.prefix_indices = self.prefix_indices[:-1]
+            self.host_hit_length -= 1
+            self.last_node = self.last_node.parent
+            self.last_host_node = self.last_host_node.parent
+            print(f"prefix indices: {self.prefix_indices}", flush=True)
+            print(f"fill_ids: {self.fill_ids}", flush=True)
+        
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):
@@ -991,6 +1000,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if self.tree_cache is not None:
                 self.tree_cache.pretty_print()
             raise RuntimeError(error_msg)
+        
+        print(f"alloc_token_slots: {out_cache_loc}", flush=True)
 
         if backup_state:
             return out_cache_loc, state

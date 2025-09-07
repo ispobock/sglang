@@ -293,6 +293,13 @@ class EagleVerifyInput:
             )
             self.last_loc = last_loc
 
+        print("prepare for verify", flush=True)
+        print(f"batch.seq_lens: {batch.seq_lens}", flush=True)
+        print(f"end_offset: {end_offset}", flush=True)
+        print(f"batch.out_cache_loc: {batch.out_cache_loc}", flush=True)
+        print(f"req_pool_indices: {batch.req_pool_indices}", flush=True)
+        print(f"batch.req_to_token_pool.req_to_token: {batch.req_to_token_pool.req_to_token}", flush=True)
+
         bs = batch.batch_size()
         assign_req_to_token_pool[(bs,)](
             batch.req_pool_indices,
