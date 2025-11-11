@@ -147,6 +147,7 @@ class Grok1MoE(nn.Module):
     ):
         super().__init__()
         self.hidden_size = hidden_size
+        self.tp_rank = get_tensor_model_parallel_rank()
 
         # Gate always runs at full precision for stability (see https://arxiv.org/pdf/2101.03961)
         self.gate = ReplicatedLinear(
@@ -184,11 +185,36 @@ class Grok1MoE(nn.Module):
             inplace=inplace,
             no_combine=no_combine,
         )
+        self.dump_res = True
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # need to assert self.gate.quant_method is unquantized
+        if self.dump_res:
+            data = {}
+            data["hidden_states"] = hidden_states
+            data["gate_weight"] = self.gate.weight.data
+            torch.save(data, f"tensors_gate_tp_{self.tp_rank}.pt")
+            self.dump_res = False
+
         topk_output = self.topk(hidden_states, self.gate.weight)
-        return self.experts(hidden_states, topk_output)
+
+        if self.tp_rank == 0:
+            print(
+                f"self.tp rank: {self.tp_rank} self.gate.weight: {self.gate.weight}, shape: {self.gate.weight.shape}",
+                flush=True,
+            )
+            print(
+                f"self.tp rank: {self.tp_rank} topk_output: {topk_output}", flush=True
+            )
+            for name, param in self.experts.named_parameters():
+                print(f"{name}:\n{param.data}\n shape: {param.data.shape}", flush=True)
+        output = self.experts(hidden_states, topk_output)
+        if self.tp_rank == 0:
+            print(
+                f"self.tp rank: {self.tp_rank} output after experts: {output}, shape: {output.shape}",
+                flush=True,
+            )
+        return output
 
 
 def _yarn_linear_ramp_mask(
@@ -221,7 +247,7 @@ def get_rope_scaling(config):
             "attn_factor": attn_factor,
             "beta_fast": beta_fast,
             "beta_slow": beta_slow,
-            "dtype": torch.float,
+            "dtype": torch.bfloat16,
         }
         return rope_scaling
     else:
@@ -341,6 +367,7 @@ class Grok1Attention(nn.Module):
         self.layer_id = layer_id
         self.hidden_size = hidden_size
         attn_tp_rank = get_tensor_model_parallel_rank()
+        self.tp_rank = attn_tp_rank
         attn_tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
@@ -387,6 +414,7 @@ class Grok1Attention(nn.Module):
             use_presharded_weights=self.load_presharded_attn,
             prefix=add_prefix("o_proj", prefix),
         )
+        print(f"reduce_results: {reduce_results}")
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
@@ -440,6 +468,7 @@ class Grok1Attention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
         self.attn.xai_temperature_len = getattr(self.config, "attn_temperature_len", -1)
+        self.dump_res = True
 
     def forward(
         self,
@@ -474,7 +503,15 @@ class Grok1Attention(nn.Module):
         dispose_tensor(hidden_states)
 
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        print(
+            f"self.tp rank: {self.tp_rank} q: {q}, k: {k}, v: {v} q.shape{q.shape}",
+            flush=True,
+        )
         q, k = self.rotary_emb(positions, q, k)
+        print(
+            f"self.tp rank: {self.tp_rank} after rope q: {q}, k: {k} q.shape{q.shape}",
+            flush=True,
+        )
 
         if debug_tensor_dump_output_folder:
             num_tokens = q.shape[0]
@@ -516,8 +553,29 @@ class Grok1Attention(nn.Module):
                     dim=1,
                 ).contiguous(),
             )
+        print(
+            f"self.tp rank: {self.tp_rank} attn_output: {attn_output}, shape: {attn_output.shape}",
+            flush=True,
+        )
+
+        # if self.dump_res:
+        #     data = {}
+        #     data["attn_output"] = attn_output
+        #     data["o_proj_weight"] = self.o_proj.weight.data
+        #     torch.save(data, f"tensors_tp_{self.tp_rank}.pt")
+        #     self.dump_res = False
 
         output, _ = self.o_proj(attn_output)
+
+        print(
+            f"self.tp rank: {self.tp_rank} output after o_proj: {output}, shape: {output.shape}",
+            flush=True,
+        )
+        print(
+            f"self.tp rank: {self.tp_rank} o_proj weights: {self.o_proj.weight}, shape: {self.o_proj.weight.shape}",
+            flush=True,
+        )
+
         return output
 
 
@@ -540,6 +598,7 @@ class Grok1DecoderLayer(nn.Module):
         self.residual_moe = getattr(config, "residual_moe", False)
         self.layer_id = layer_id
         self.alt_stream = alt_stream or torch.cuda.Stream()
+        self.tp_rank = get_tensor_model_parallel_rank()
 
         rope_theta = getattr(config, "rope_theta", 10000)
         self.self_attn = Grok1Attention(
@@ -656,14 +715,37 @@ class Grok1DecoderLayer(nn.Module):
             dispose_flag = True
             dispose_tensor(hidden_states_original)
 
+        print(f"self.tp_rank: {self.tp_rank}", flush=True)
+        if self.tp_rank == 0:
+            print(
+                f"hidden_states before attn: {hidden_states}, shape: {hidden_states.shape}",
+                flush=True,
+            )
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
 
+        if self.tp_rank == 0:
+            print(
+                f"hidden_states after attn: {hidden_states}, shape: {hidden_states.shape}",
+                flush=True,
+            )
+
         if get_tensor_model_parallel_world_size() > 1:
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+
+        if self.tp_rank == 0:
+            print(
+                f"residual before rmsnorm: {residual}, shape: {residual.shape}",
+                flush=True,
+            )
+            print(
+                f"hidden_states before fused_dual_residual_rmsnorm: {hidden_states}, shape: {hidden_states.shape}",
+                flush=True,
+            )
 
         hidden_states, residual = fused_dual_residual_rmsnorm(
             hidden_states,
@@ -676,8 +758,25 @@ class Grok1DecoderLayer(nn.Module):
         if not dispose_flag:
             dispose_tensor(hidden_states_original)
 
+        if self.tp_rank == 0:
+            print(
+                f"residual after rmsnorm: {residual}, shape: {residual.shape}",
+                flush=True,
+            )
+            print(
+                f"hidden_states before ffn: {hidden_states}, shape: {hidden_states.shape}",
+                flush=True,
+            )
+
         # Fully Connected
         hidden_states = self.ffn(hidden_states)
+
+        if self.tp_rank == 0:
+            print(
+                f"hidden_states after ffn: {hidden_states}, shape: {hidden_states.shape}",
+                flush=True,
+            )
+
         return hidden_states, residual, self.post_moe_norm  # defer layernorm
 
     def moe_with_rmoe(self, x):
@@ -886,8 +985,14 @@ class Grok1ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         if debug_tensor_dump_output_folder:
             dump_to_file(debug_tensor_dump_output_folder, "input_ids", input_ids)
-
+        if get_tensor_model_parallel_rank() == 0:
+            print(f"input_ids: {input_ids}", flush=True)
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        if get_tensor_model_parallel_rank() == 0:
+            print(
+                f"hidden_states after forward: {hidden_states}, shape: {hidden_states.shape}",
+                flush=True,
+            )
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
@@ -989,6 +1094,9 @@ class Grok1ForCausalLM(nn.Module):
                         continue
 
                     load_weight_wrapper(name=name, loaded_weight=loaded_weight)
+
+        # for name, param in self.named_parameters():
+        #     print(f"{name}:\n{param.data}\n", flush=True)
 
         if check_hit_names:
             if len(hit_names) > 5:

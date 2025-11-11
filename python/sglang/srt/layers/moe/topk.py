@@ -266,6 +266,8 @@ class TopK(CustomOp):
         else:
             output_format = TopKOutputFormat.STANDARD
 
+        print(f"output_format: {output_format=}")
+
         if output_format == TopKOutputFormat.TRITON_KERNEL:
             # renormalize=True is equivalent to sm_first=False
             routing_data, gather_idx, scatter_idx = routing(
@@ -912,6 +914,7 @@ def select_experts(
         ), "num_token_non_padded is not yet supported in custom_routing_function"
         assert expert_location_dispatch_info is None
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
+        print(f"use custom_routing_function for topk")
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,

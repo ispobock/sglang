@@ -584,6 +584,11 @@ class LogitsProcessor(nn.Module):
                 logits_metadata,
             )
 
+        print(
+            f"next_token_logits: {sampled_logits}, shape: {sampled_logits.shape}",
+            flush=True,
+        )
+
         return LogitsProcessorOutput(
             next_token_logits=sampled_logits,
             hidden_states=hidden_states_to_store,

@@ -16,6 +16,7 @@ def fused_moe_router_cudacore_kernel(
     moe_router_weight_ptr,  # input (num_experts, hidden_dim)
     topk_weights_ptr,  # output (bs, topk)
     topk_ids_ptr,  # output (bs, topk)
+    mid_logits_ptr,  # output (bs, num_experts)
     correction_bias_ptr,
     is_correction_bias: tl.constexpr,
     num_experts: tl.constexpr,
@@ -43,6 +44,15 @@ def fused_moe_router_cudacore_kernel(
 
     # todo: tl.dot?
     logits = tl.sum((w_router.to(tl.float32) * x[None, :].to(tl.float32)), axis=-1)
+
+    tl.static_print(logits)
+    offsets1 = tl.arange(0, 8)
+    mask1 = offsets1 < num_experts
+    tl.store(
+        mid_logits_ptr + pid * num_experts + offsets1,
+        logits,
+        mask=mask1,
+    )
 
     # logit softcap
     if moe_softcapping == 0:
@@ -138,11 +148,14 @@ def fused_moe_router_cudacore(
         ),
     }
 
+    mid_logits = torch.empty((bs, num_experts), dtype=torch.float32, device=x.device)
+
     fused_moe_router_cudacore_kernel[(bs,)](
         x,
         router_weight,
         topk_weights,
         topk_ids,
+        mid_logits,
         correction_bias,
         is_correction_bias=is_correction_bias,
         num_experts=num_experts,
@@ -152,6 +165,8 @@ def fused_moe_router_cudacore(
         hidden_dim=hidden_dim,
         **config,
     )
+
+    print(f"mid_logits: {mid_logits}")
 
     return topk_weights, topk_ids
 
@@ -379,6 +394,7 @@ def fused_moe_router_shim(
             correction_bias=correction_bias,
         )
     else:
+        print("use fused_moe_router_cudacore")
         # if smaller, use kernel that does not use tensorcore in matmul
         return fused_moe_router_cudacore(
             x=hidden_states,
